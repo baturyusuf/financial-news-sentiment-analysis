@@ -34,8 +34,6 @@ def main():
     processed_df['sentiment'] = processed_df['Headline'].apply(extractor.get_sentiment)
     embeddings = np.array([extractor.get_embedding(text) for text in processed_df['Headline']])
 
-
-
     # Diğer özellikleri ekle
     processed_df = build_features.add_technical_indicators(processed_df)
     processed_df = build_features.create_lagged_features(processed_df, 'Index_Change_Percent')
