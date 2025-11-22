@@ -37,40 +37,55 @@ def main():
 
 
     # Diğer özellikleri ekle
+    processed_df = build_features.add_technical_indicators(processed_df)
     processed_df = build_features.create_lagged_features(processed_df, 'Index_Change_Percent')
 
     # === ADIM 4: Hibrit Vektör ve Veri Bölme ===
     print("Veri, eğitim ve test setlerine bölünüyor...")
 
-    # Sayısal özellikleri ve duygu skorunu hazırla
-    sentiment_dummies = pd.get_dummies(processed_df['sentiment'], prefix='sent')
-    numerical_features = processed_df[['Trading_Volume', 'Previous_Index_Change_Percent_1d']]
-    numerical_features = pd.concat([numerical_features, sentiment_dummies], axis=1)
-
-    # Özellikleri ölçeklendir (XGBoost için şart değil ama LSTM için önemli)
-    scaler = StandardScaler()
-    numerical_features_scaled = scaler.fit_transform(numerical_features)
-
-    # Sayısal özellikleri ve FinBERT gömmelerini birleştir
-    # --- TEST: 768 boyutlu vektörleri geçici olarak devre dışı bırak ---
-    X_hybrid = numerical_features_scaled
-    # X_hybrid = np.concatenate([numerical_features_scaled, embeddings], axis=1)
-
-    # Hedef değişkenleri al
-    y_classification = processed_df['Movement_Direction'].values
-    y_regression = processed_df['Index_Change_Percent'].values
-
-    # Veriyi zamansal olarak böl (Indeksleri kullanarak)
+    # 1. Önce DataFrame'i zamana göre bölüyoruz (Burası ÇOK ÖNEMLİ: Scaler'dan önce yapılmalı)
     train_df, val_df, test_df = make_dataset.split_data_chronological(processed_df)
 
-    train_indices = train_df.index
-    val_indices = val_df.index
+    # İndeksleri alalım (Numpy array'lerden veriyi çekmek için lazım olacak)
+    train_idx = train_df.index
+    val_idx = val_df.index
+    # test_idx = test_df.index # İleride test için lazım olursa
+
+    # 2. Kullanılacak Sayısal Özellikleri Belirle
+    # Not: 'SMA_7' ve 'Momentum' build_features'ta eklediğimiz yeni sütunlar
+    numeric_cols = ['Trading_Volume', 'Previous_Index_Change_Percent_1d', 'SMA_7', 'Momentum']
+
+    # Eğer sentiment dummy kullanıyorsan onları da listeye ekle veya ayrı tut
+    sentiment_dummies = pd.get_dummies(processed_df['sentiment'], prefix='sent')
+
+    # Tüm sayısal veriyi geçici olarak birleştir (Henüz scale etme!)
+    X_numeric_all = pd.concat([processed_df[numeric_cols], sentiment_dummies], axis=1)
+
+    # 3. Scaler'ı SADECE Eğitim (Train) verisi üzerinde eğit (.fit)
+    scaler = StandardScaler()
+
+    # Sadece train indekslerine denk gelen veriyi alıp fit ediyoruz
+    scaler.fit(X_numeric_all.loc[train_idx])
+
+    # 4. Şimdi tüm veriyi dönüştür (.transform)
+    X_numeric_scaled = scaler.transform(X_numeric_all)  # Bu bize numpy array döndürür
+
+    # 5. Sayısal Veriler ile BERT Embeddinglerini Birleştir (Modelin Gözünü Açıyoruz!)
+    # X_numeric_scaled (Sayısal) + embeddings (Metin)
+    X_hybrid = np.concatenate([X_numeric_scaled, embeddings], axis=1)
+
+    # 6. Son olarak X ve y verilerini train/val olarak ayır
+
+    # Hedef değişkenler
+    y_classification = processed_df['Movement_Direction'].values
+    # y_regression = processed_df['Index_Change_Percent'].values # LSTM için gerekirse
 
     # Sınıflandırma Verisi (XGBoost için)
-    X_train_clf = X_hybrid[train_indices]
-    y_train_clf = y_classification[train_indices]
-    X_val_clf = X_hybrid[val_indices]
-    y_val_clf = y_classification[val_indices]
+    X_train_clf = X_hybrid[train_idx]
+    y_train_clf = y_classification[train_idx]
+
+    X_val_clf = X_hybrid[val_idx]
+    y_val_clf = y_classification[val_idx]
 
     # Regresyon Verisi (LSTM için)
     # Not: LSTM için X_hybrid ve y_regression verilerini sıralı hale getirmeliyiz

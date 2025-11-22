@@ -48,3 +48,22 @@ def create_lagged_features(df: pd.DataFrame, col_name: str, lag_days: int = 1) -
     df[f'Previous_{col_name}_{lag_days}d'] = df[col_name].shift(lag_days)
     df.fillna(0, inplace=True)  # shift() sonrası oluşan NaN'ları doldur
     return df
+
+
+def add_technical_indicators(df, price_col='Index_Change_Percent'):
+    """
+    Veri setine teknik analiz indikatörleri ekler.
+    """
+    # 1. Basit Hareketli Ortalama (SMA - 7 Günlük)
+    # Piyasanın haftalık trendini gösterir.
+    df['SMA_7'] = df[price_col].rolling(window=7).mean()
+
+    # 2. Momentum (4 Günlük)
+    # 4 gün öncesine göre değişim hızı.
+    df['Momentum'] = df[price_col] - df[price_col].shift(4)
+
+    # 3. Eksik verileri (ilk 7 gün NaN olacaktır) doldur
+    df['SMA_7'] = df['SMA_7'].fillna(0)
+    df['Momentum'] = df['Momentum'].fillna(0)
+
+    return df

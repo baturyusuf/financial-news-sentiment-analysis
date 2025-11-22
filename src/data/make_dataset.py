@@ -19,11 +19,17 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def create_target_variables(df: pd.DataFrame) -> pd.DataFrame:
-    """Sınıflandırma ve regresyon için hedef değişkenleri oluşturur."""
-    # Notebook'taki 'Movement_Direction' oluşturma satırınız [cite: 209]
-    df['Movement_Direction'] = (df['Index_Change_Percent'] > 0).astype(int)
-    return df
+def create_target_variables(df: pd.DataFrame, threshold=0.005) -> pd.DataFrame:
+    """
+    Sadece %0.5'ten büyük değişimleri hedef al.
+    Aradaki küçük değişimleri ya 'Nötr' yap ya da eğitimden çıkar.
+    """
+    # Örnek: Küçük değişimleri veri setinden atarak modeli net sinyallere odakla
+    mask = abs(df['Index_Change_Percent']) > threshold
+    df_filtered = df[mask].copy()
+
+    df_filtered['Movement_Direction'] = (df_filtered['Index_Change_Percent'] > 0).astype(int)
+    return df_filtered
 
 
 def split_data_chronological(df: pd.DataFrame, test_size=0.15, val_size=0.15):
