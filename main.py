@@ -76,7 +76,7 @@ def main():
 
     # Hedef değişkenler
     y_classification = processed_df['Movement_Direction'].values
-    # y_regression = processed_df['Index_Change_Percent'].values # LSTM için gerekirse
+    y_regression = processed_df['Index_Change_Percent'].values # LSTM için gerekirse
 
     # Sınıflandırma Verisi (XGBoost için)
     X_train_clf = X_hybrid[train_idx]
@@ -91,12 +91,68 @@ def main():
     # === ADIM 5: Model Eğitimi ===
     print("Modeller eğitiliyor...")
 
-    # Model 1: XGBoost Sınıflandırıcı
-    train_model.train_xgboost_classifier(X_train_clf, y_train_clf, X_val_clf, y_val_clf)
+    # Sayısal özelliklerin isimlerini alalım
+    numeric_feature_names = list(X_numeric_all.columns)
 
-    # Model 2 & 3: XGBoost ve LSTM Regresörler...
-    # (LSTM için 'train_model.create_lstm_sequences' fonksiyonunu burada çağırın)
-    # ...
+    # FinBERT embeddingleri için yapay isimler oluştur (embed_0, embed_1...)
+    # Embedding boyutu 768
+    embedding_feature_names = [f'bert_emb_{i}' for i in range(embeddings.shape[1])]
+
+    # Tüm özellik isimlerini birleştir
+    all_feature_names = numeric_feature_names + embedding_feature_names
+
+    # Model 1: XGBoost Sınıflandırıcı (Feature Names parametresini ekledik)
+    train_model.train_xgboost_classifier(X_train_clf, y_train_clf, X_val_clf, y_val_clf,
+                                         feature_names=all_feature_names)
+
+    # Model 2: LSTM (Eğer aktif edeceksen)
+    # ... (XGBoost kodları bittikten hemen sonra buraya yapıştır) ...
+
+    print("\n" + "=" * 30)
+    print("LSTM EĞİTİM SÜRECİ BAŞLIYOR")
+    print("=" * 30)
+
+    # 1. Parametreler
+    SEQ_LENGTH = 5  # Model geçmiş 5 güne bakarak tahmin yapacak
+
+    # 2. Veriyi LSTM formatına (Samples, Timesteps, Features) dönüştür
+    # X_hybrid: Hibrit özellikler (Sayısal + FinBERT)
+    # y_regression: Hedef değişken (Index_Change_Percent)
+    print(f"LSTM dizileri oluşturuluyor (Geçmiş {SEQ_LENGTH} gün)...")
+    X_seq, y_seq = train_model.create_lstm_sequences(X_hybrid, y_regression, SEQ_LENGTH)
+
+    # 3. Sıralı Bölme (Chronological Split)
+    # Dizileme işlemi ilk 5 satırı yuttuğu için indeksleri yeniden hesaplıyoruz
+    total_len = len(X_seq)
+    train_size = int(total_len * 0.70)
+    val_size = int(total_len * 0.15)
+
+    # Train Seti
+    X_train_lstm = X_seq[:train_size]
+    y_train_lstm = y_seq[:train_size]
+
+    # Validation Seti
+    X_val_lstm = X_seq[train_size: train_size + val_size]
+    y_val_lstm = y_seq[train_size: train_size + val_size]
+
+    # (Opsiyonel) Test Seti - Kalan kısım
+    # X_test_lstm = X_seq[train_size + val_size :]
+    # y_test_lstm = y_seq[train_size + val_size :]
+
+    print(f"LSTM Veri Boyutları -> Train: {X_train_lstm.shape}, Val: {X_val_lstm.shape}")
+
+    # 4. Modelin Beklediği Input Şekli (Timesteps, Features)
+    # Örnek: (5, 772) -> 5 gün, 772 özellik (768 BERT + 4 Sayısal)
+    input_shape = (X_train_lstm.shape[1], X_train_lstm.shape[2])
+
+    # 5. Modeli Eğit
+    train_model.train_lstm_regressor(
+        X_train_lstm,
+        y_train_lstm,
+        X_val_lstm,
+        y_val_lstm,
+        input_shape
+    )
 
     print("Pipeline tamamlandı.")
 
