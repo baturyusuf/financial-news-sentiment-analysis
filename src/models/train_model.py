@@ -140,7 +140,7 @@ def train_lstm_regressor(X_train_seq, y_train_seq, X_val_seq, y_val_seq, input_s
 
     history = model.fit(X_train_seq, y_train_seq,
                         validation_data=(X_val_seq, y_val_seq),
-                        batch_size=32,  # 16 çok gürültülü olabilir, 32 standardına dönelim
+                        batch_size=16,  # 16 çok gürültülü olabilir, 32 standardına dönelim
                         epochs=100,
                         callbacks=[early_stop, reduce_lr],
                         verbose=1)

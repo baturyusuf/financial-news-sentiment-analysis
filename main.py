@@ -21,7 +21,36 @@ def main():
     print("Veri yükleniyor ve ön işleniyor...")
     raw_df = make_dataset.load_raw_data('data/raw/financial_news_market_events_2025.csv')
     processed_df = make_dataset.preprocess_data(raw_df)
+
+    # target oluşturma (filtreli df döndürüyor)
     processed_df = make_dataset.create_target_variables(processed_df)
+    processed_df = processed_df.reset_index(drop=True)   # ✅ şart
+
+
+    # === ADIM 1.5: Emtia feature'ları ===
+#    processed_df = build_features.add_commodity_features(processed_df, date_col="Date")
+    processed_df = build_features.add_commodity_features(processed_df, date_col="Date", debug=True)
+
+    # === ADIM 2: Şirket adı başlıkta geçiyor mu? ===
+    processed_df = build_features.add_company_mention_feature(
+        processed_df,
+        headline_col="Headline",
+        related_company_col="Related_Company",
+        out_col="mentions_related_company_in_headline"
+    )
+
+    # (Opsiyonel) Dataset'te Ticker/Company yoksa böyle çağır:
+    processed_df = build_features.add_stock_mention_feature(
+        processed_df,
+        headline_col="Headline",
+        ticker_col=None,
+        company_col=None,
+        out_col="mentions_stock"
+    )
+
+    # ... bundan sonra senin FinBERT + indicators + split vs devam ...
+
+
 
     # === ADIM 2: Metin İşleme ===
     print("Metin verisi temizleniyor (NLP)...")
@@ -51,7 +80,15 @@ def main():
 
     # 2. Kullanılacak Sayısal Özellikleri Belirle
     # Not: 'SMA_7' ve 'Momentum' build_features'ta eklediğimiz yeni sütunlar
-    numeric_cols = ['Trading_Volume', 'Previous_Index_Change_Percent_1d', 'SMA_7', 'Momentum']
+    numeric_cols = [
+        'Trading_Volume',
+        'Previous_Index_Change_Percent_1d',
+        'SMA_7',
+        'Momentum',
+        'Gold_close_t1', 'Gold_ret1_t1',
+        'Oil_close_t1', 'Oil_ret1_t1',
+        'mentions_related_company_in_headline'
+    ]
 
     # Eğer sentiment dummy kullanıyorsan onları da listeye ekle veya ayrı tut
     sentiment_dummies = pd.get_dummies(processed_df['sentiment'], prefix='sent')
