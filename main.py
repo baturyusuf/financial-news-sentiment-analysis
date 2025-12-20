@@ -1,197 +1,175 @@
 import nltk
-nltk.download('wordnet')
-nltk.download('stopwords')
+
+nltk.download('wordnet', quiet=True)
+nltk.download('stopwords', quiet=True)
 
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-# 1. Veri Yükleme ve İşleme Modüllerimiz
+# Modüller
 from src.data import make_dataset
-# 2. Özellik Mühendisliği Modüllerimiz
 from src.features import text_preprocessing, build_features
-# 3. Model Eğitme Modüllerimiz
 from src.models import train_model
 
 
 def main():
-    print("Proje pipeline'ı başlıyor...")
+    print("=" * 60)
+    print("PROJE PIPELINE (CORRECT SEQUENCE VERSION)")
+    print("=" * 60)
 
-    # === ADIM 1: Veri Yükleme ve Ön İşleme ===
-    print("Veri yükleniyor ve ön işleniyor...")
+    # === ADIM 1: Veri Yükleme ===
+    print("[1/6] Veri yükleniyor...")
     raw_df = make_dataset.load_raw_data('data/raw/financial_news_market_events_2025.csv')
+
+    # İndeksi baştan güvenceye alalım
     processed_df = make_dataset.preprocess_data(raw_df)
+    processed_df = processed_df.reset_index(drop=True)
 
-    # target oluşturma (filtreli df döndürüyor)
-    processed_df = make_dataset.create_target_variables(processed_df)
-    processed_df = processed_df.reset_index(drop=True)   # ✅ şart
+    # === ADIM 2: ÖZELLİK MÜHENDİSLİĞİ (FİLTRELEMEDEN ÖNCE YAPILMALI!) ===
+    # Zaman serisi bozulmadan önce indikatörleri hesaplıyoruz.
+    print("[2/6] Özellikler ekleniyor (Zaman serisi bozulmadan)...")
 
+    # 2.1 Emtia
+    processed_df = build_features.add_commodity_features(processed_df, date_col="Date")
 
-    # === ADIM 1.5: Emtia feature'ları ===
-#    processed_df = build_features.add_commodity_features(processed_df, date_col="Date")
-    processed_df = build_features.add_commodity_features(processed_df, date_col="Date", debug=True)
-
-    # === ADIM 2: Şirket adı başlıkta geçiyor mu? ===
-    processed_df = build_features.add_company_mention_feature(
-        processed_df,
-        headline_col="Headline",
-        related_company_col="Related_Company",
-        out_col="mentions_related_company_in_headline"
-    )
-
-    # (Opsiyonel) Dataset'te Ticker/Company yoksa böyle çağır:
-    processed_df = build_features.add_stock_mention_feature(
-        processed_df,
-        headline_col="Headline",
-        ticker_col=None,
-        company_col=None,
-        out_col="mentions_stock"
-    )
-
-    # ... bundan sonra senin FinBERT + indicators + split vs devam ...
-
-
-
-    # === ADIM 2: Metin İşleme ===
-    print("Metin verisi temizleniyor (NLP)...")
-    # .apply() notebook'ta yavaşsa burada pandas_apply kullanabilirsiniz (tqdm ile)
-    # Metin temizlemeyi SADECE eski modeller için saklayın, BERT için DEĞİL.
-    # processed_df['cleaned_headline'] = processed_df['Headline'].apply(text_preprocessing.full_text_pipeline)
-    ...
-    extractor = build_features.FinbertFeatureExtractor()
-    # FinBERT'e ORİJİNAL, ham başlığı verin
-    processed_df['sentiment'] = processed_df['Headline'].apply(extractor.get_sentiment)
-    embeddings = np.array([extractor.get_embedding(text) for text in processed_df['Headline']])
-
-    # Diğer özellikleri ekle
+    # 2.2 Teknik İndikatörler (RSI, Volatilite)
     processed_df = build_features.add_technical_indicators(processed_df)
+
+    # 2.3 Lag Özellikleri (Geçmiş günler)
     processed_df = build_features.create_lagged_features(processed_df, 'Index_Change_Percent')
 
-    # === ADIM 4: Hibrit Vektör ve Veri Bölme ===
-    print("Veri, eğitim ve test setlerine bölünüyor...")
+    # 2.4 Keyword / Şirket Taraması
+    processed_df = build_features.add_stock_mention_feature(processed_df, out_col="mentions_stock")
+    processed_df = build_features.add_company_mention_feature(processed_df)
 
-    # 1. Önce DataFrame'i zamana göre bölüyoruz (Burası ÇOK ÖNEMLİ: Scaler'dan önce yapılmalı)
+    # Lag işlemi (shift) yüzünden oluşan ilk satırlardaki NaN'ları temizle
+    processed_df = processed_df.dropna()
+    processed_df = processed_df.reset_index(drop=True)  # İndeksi tazeleyelim
+
+    # === ADIM 3: HEDEF BELİRLEME VE FİLTRELEME ===
+    # === ADIM 3: HEDEF BELİRLEME VE FİLTRELEME ===
+    print("[3/6] Hedef değişkenler ve Filtreleme...")
+
+    # Hedef: Yarının değişimi
+    processed_df['Target_Index_Change'] = processed_df['Index_Change_Percent'].shift(-1)
+
+    # NaN olan (son gün) satırını at
+    processed_df = processed_df.dropna(subset=['Target_Index_Change'])
+
+    # --- VERİ ANALİZİ ---
+    print("Veri İstatistiği (Tüm Veri):")
+    print(processed_df['Target_Index_Change'].describe())
+
+    # [GÜNCELLEME] SABİT EŞİK DEĞERİ (THRESHOLD)
+    # %0.5 (Yani 0.5) altındaki hareketleri gürültü sayıp atıyoruz.
+    # %3.6 gibi uçuk değerlere gitmiyoruz.
+    THRESHOLD = 0.5
+
+    abs_change = abs(processed_df['Target_Index_Change'])
+
+    # Filtreleme
+    processed_df = processed_df[abs_change > THRESHOLD]
+
+    # Yön Belirleme
+    processed_df['Target_Direction'] = (processed_df['Target_Index_Change'] > 0).astype(int)
+
+    print(f"Eşik Değeri ({THRESHOLD}) Uygulandı.")
+    print(f"FİLTRE SONRASI Eğitime girecek satır sayısı: {len(processed_df)}")
+    # === ADIM 4: FinBERT Embedding (SENKRONİZASYON GARANTİLİ) ===
+    print("[4/6] FinBERT Embeddingleri hesaplanıyor...")
+
+    # DİKKAT: Embedding'i SADECE kalan satırlar için hesaplıyoruz.
+    extractor = build_features.FinbertFeatureExtractor()
+
+    embeddings_list = []
+    sentiments_list = []
+
+    headlines = processed_df['Headline'].tolist()
+    total = len(headlines)
+
+    print(f"Toplam {total} başlık işleniyor...")
+
+    for i, text in enumerate(headlines):
+        if i % 100 == 0: print(f"  Processed {i}/{total}")
+        emb = extractor.get_embedding(text)
+        sent = extractor.get_sentiment(text)
+        embeddings_list.append(emb)
+        sentiments_list.append(sent)
+
+    embeddings = np.array(embeddings_list)
+    processed_df['sentiment'] = sentiments_list
+
+    print(f"Embedding Shape: {embeddings.shape}")
+    print(f"DataFrame Shape: {processed_df.shape}")
+
+    assert len(embeddings) == len(processed_df), "HATA: Embedding ve DataFrame satır sayıları tutmuyor!"
+
+    # === ADIM 5: Veri Hazırlığı ===
+    print("[5/6] Veri setleri bölünüyor...")
+
+    # Kronolojik Bölme
     train_df, val_df, test_df = make_dataset.split_data_chronological(processed_df)
 
-    # İndeksleri alalım (Numpy array'lerden veriyi çekmek için lazım olacak)
-    train_idx = train_df.index
-    val_idx = val_df.index
-    # test_idx = test_df.index # İleride test için lazım olursa
+    train_idx = range(0, len(train_df))
+    val_idx = range(len(train_df), len(train_df) + len(val_df))
 
-    # 2. Kullanılacak Sayısal Özellikleri Belirle
-    # Not: 'SMA_7' ve 'Momentum' build_features'ta eklediğimiz yeni sütunlar
+    # --- HİLE TESTİ (KAPALI) ---
+    # processed_df['CHEAT_CODE'] = processed_df['Target_Index_Change']
+    # ---------------------------
+
     numeric_cols = [
+        # 'CHEAT_CODE',
         'Trading_Volume',
         'Previous_Index_Change_Percent_1d',
-        'SMA_7',
-        'Momentum',
+        'Volatility_7d',
+        'RSI_14',
+        'Cumulative_Return_3d',
         'Gold_close_t1', 'Gold_ret1_t1',
         'Oil_close_t1', 'Oil_ret1_t1',
-        'mentions_related_company_in_headline'
+        'keyword_bullish',
+        'keyword_bearish',
+        'mentions_stock'
     ]
 
-    # Eğer sentiment dummy kullanıyorsan onları da listeye ekle veya ayrı tut
+    # Sentiment Dummies
     sentiment_dummies = pd.get_dummies(processed_df['sentiment'], prefix='sent')
+    processed_df = pd.concat([processed_df, sentiment_dummies], axis=1)
 
-    # Tüm sayısal veriyi geçici olarak birleştir (Henüz scale etme!)
-    X_numeric_all = pd.concat([processed_df[numeric_cols], sentiment_dummies], axis=1)
+    actual_numeric_cols = [c for c in numeric_cols if c in processed_df.columns]
+    actual_numeric_cols += list(sentiment_dummies.columns)
 
-    # 3. Scaler'ı SADECE Eğitim (Train) verisi üzerinde eğit (.fit)
+    X_numeric_all = processed_df[actual_numeric_cols]
+
+    # Scaler
     scaler = StandardScaler()
+    scaler.fit(X_numeric_all.iloc[train_idx])
+    X_numeric_scaled = scaler.transform(X_numeric_all)
 
-    # Sadece train indekslerine denk gelen veriyi alıp fit ediyoruz
-    scaler.fit(X_numeric_all.loc[train_idx])
+    # Eğitim ve Val Setlerini Ayır
+    X_num_train = X_numeric_scaled[train_idx]
+    X_emb_train = embeddings[train_idx]
+    y_train = processed_df.iloc[train_idx]['Target_Direction'].values
 
-    # 4. Şimdi tüm veriyi dönüştür (.transform)
-    X_numeric_scaled = scaler.transform(X_numeric_all)  # Bu bize numpy array döndürür
+    X_num_val = X_numeric_scaled[val_idx]
+    X_emb_val = embeddings[val_idx]
+    y_val = processed_df.iloc[val_idx]['Target_Direction'].values
 
-    # 5. Sayısal Veriler ile BERT Embeddinglerini Birleştir (Modelin Gözünü Açıyoruz!)
-    # X_numeric_scaled (Sayısal) + embeddings (Metin)
-    X_hybrid = np.concatenate([X_numeric_scaled, embeddings], axis=1)
+    # === ADIM 6: Model Eğitimi ===
+    print("[6/6] Model Eğitimi (Random Forest)...")
+    print(f"Kullanılan özellikler: {actual_numeric_cols}")
 
-    # 6. Son olarak X ve y verilerini train/val olarak ayır
-
-    # Hedef değişkenler
-    y_classification = processed_df['Movement_Direction'].values
-    y_regression = processed_df['Index_Change_Percent'].values # LSTM için gerekirse
-
-    # Sınıflandırma Verisi (XGBoost için)
-    X_train_clf = X_hybrid[train_idx]
-    y_train_clf = y_classification[train_idx]
-
-    X_val_clf = X_hybrid[val_idx]
-    y_val_clf = y_classification[val_idx]
-
-    # Regresyon Verisi (LSTM için)
-    # Not: LSTM için X_hybrid ve y_regression verilerini sıralı hale getirmeliyiz
-
-    # === ADIM 5: Model Eğitimi ===
-    print("Modeller eğitiliyor...")
-
-    # Sayısal özelliklerin isimlerini alalım
-    numeric_feature_names = list(X_numeric_all.columns)
-
-    # FinBERT embeddingleri için yapay isimler oluştur (embed_0, embed_1...)
-    # Embedding boyutu 768
-    embedding_feature_names = [f'bert_emb_{i}' for i in range(embeddings.shape[1])]
-
-    # Tüm özellik isimlerini birleştir
-    all_feature_names = numeric_feature_names + embedding_feature_names
-
-    # Model 1: XGBoost Sınıflandırıcı (Feature Names parametresini ekledik)
-    train_model.train_xgboost_classifier(X_train_clf, y_train_clf, X_val_clf, y_val_clf,
-                                         feature_names=all_feature_names)
-
-    # Model 2: LSTM (Eğer aktif edeceksen)
-    # ... (XGBoost kodları bittikten hemen sonra buraya yapıştır) ...
-
-    print("\n" + "=" * 30)
-    print("LSTM EĞİTİM SÜRECİ BAŞLIYOR")
-    print("=" * 30)
-
-    # 1. Parametreler
-    SEQ_LENGTH = 5  # Model geçmiş 5 güne bakarak tahmin yapacak
-
-    # 2. Veriyi LSTM formatına (Samples, Timesteps, Features) dönüştür
-    # X_hybrid: Hibrit özellikler (Sayısal + FinBERT)
-    # y_regression: Hedef değişken (Index_Change_Percent)
-    print(f"LSTM dizileri oluşturuluyor (Geçmiş {SEQ_LENGTH} gün)...")
-    X_seq, y_seq = train_model.create_lstm_sequences(X_hybrid, y_regression, SEQ_LENGTH)
-
-    # 3. Sıralı Bölme (Chronological Split)
-    # Dizileme işlemi ilk 5 satırı yuttuğu için indeksleri yeniden hesaplıyoruz
-    total_len = len(X_seq)
-    train_size = int(total_len * 0.70)
-    val_size = int(total_len * 0.15)
-
-    # Train Seti
-    X_train_lstm = X_seq[:train_size]
-    y_train_lstm = y_seq[:train_size]
-
-    # Validation Seti
-    X_val_lstm = X_seq[train_size: train_size + val_size]
-    y_val_lstm = y_seq[train_size: train_size + val_size]
-
-    # (Opsiyonel) Test Seti - Kalan kısım
-    # X_test_lstm = X_seq[train_size + val_size :]
-    # y_test_lstm = y_seq[train_size + val_size :]
-
-    print(f"LSTM Veri Boyutları -> Train: {X_train_lstm.shape}, Val: {X_val_lstm.shape}")
-
-    # 4. Modelin Beklediği Input Şekli (Timesteps, Features)
-    # Örnek: (5, 772) -> 5 gün, 772 özellik (768 BERT + 4 Sayısal)
-    input_shape = (X_train_lstm.shape[1], X_train_lstm.shape[2])
-
-    # 5. Modeli Eğit
-    train_model.train_lstm_regressor(
-        X_train_lstm,
-        y_train_lstm,
-        X_val_lstm,
-        y_val_lstm,
-        input_shape
+    train_model.train_rf_optimized(
+        X_numeric=X_num_train,
+        embeddings=X_emb_train,
+        y_train=y_train,
+        X_numeric_val=X_num_val,
+        embeddings_val=X_emb_val,
+        y_val=y_val,
+        feature_names=actual_numeric_cols
     )
 
-    print("Pipeline tamamlandı.")
+    print("\nTAMAMLANDI.")
 
 
 if __name__ == "__main__":

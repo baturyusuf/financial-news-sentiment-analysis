@@ -1,25 +1,23 @@
 # src/models/train_model.py
 
-from xgboost import XGBClassifier, XGBRegressor
-from xgboost import plot_importance
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score, confusion_matrix, \
-    mean_squared_error
-import joblib
-import numpy as np
-import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.decomposition import PCA
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 import matplotlib.pyplot as plt
 import seaborn as sns
+import pandas as pd
+import numpy as np
 import os
-from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+import joblib
 
-# Grafikleri kaydetmek için klasör oluştur
+# Sonuç klasörü
 os.makedirs('results', exist_ok=True)
+os.makedirs('models', exist_ok=True)
 
 
-def create_lstm_sequences(data: np.ndarray, target: np.ndarray, seq_length: int):
-    """LSTM için (samples, timesteps, features) formatında veri hazırlar."""
+def create_lstm_sequences(data, target, seq_length):
+    # LSTM fonksiyonu (Gerekirse kalsın, şu an kullanmıyoruz)
     X, y = [], []
     for i in range(len(data) - seq_length):
         X.append(data[i:(i + seq_length)])
@@ -27,147 +25,78 @@ def create_lstm_sequences(data: np.ndarray, target: np.ndarray, seq_length: int)
     return np.array(X), np.array(y)
 
 
-def train_xgboost_classifier(X_train, y_train, X_val, y_val, feature_names=None):
+def train_rf_optimized(X_numeric, embeddings, y_train, X_numeric_val, embeddings_val, y_val, feature_names):
     """
-    XGBoost Sınıflandırıcıyı eğitir, Table I metriklerini basar
-    ve Confusion Matrix + Feature Importance grafiklerini çizer.
+    SelectKBest OLMADAN, Tüm özellikleri kullanan Random Forest.
     """
-    print("\n[XGBoost] Model eğitiliyor...")
-    model = XGBClassifier(
-        use_label_encoder=False,
-        eval_metric='logloss',
-        early_stopping_rounds=10,
-        n_estimators=1000,
-        learning_rate=0.05
+    print("\n[Random Forest] Kapsamlı eğitim başlıyor (Tüm Özellikler)...")
+
+    # --- ADIM 1: Embedding Sıkıştırma (PCA) ---
+    # 768 boyutu yine de biraz indirelim ki model boğulmasın.
+    n_components = 15
+    pca = PCA(n_components=n_components)
+
+    print(f"BERT Embedding'leri PCA ile {n_components} boyuta indiriliyor...")
+    X_emb_train_pca = pca.fit_transform(embeddings)
+    X_emb_val_pca = pca.transform(embeddings_val)
+
+    pca_cols = [f"PCA_Emb_{i}" for i in range(n_components)]
+
+    # --- ADIM 2: Verileri Birleştirme ---
+    # Sayısal veriler
+    if isinstance(X_numeric, pd.DataFrame):
+        X_num_train = X_numeric.values
+        X_num_val = X_numeric_val.values
+    else:
+        X_num_train = X_numeric
+        X_num_val = X_numeric_val
+
+    # Hepsini yan yana koy
+    X_train_combined = np.hstack([X_num_train, X_emb_train_pca])
+    X_val_combined = np.hstack([X_num_val, X_emb_val_pca])
+
+    # Tüm isimler
+    all_feature_names = feature_names + pca_cols
+
+    print(f"Toplam Özellik Sayısı: {len(all_feature_names)}")
+
+    # --- ADIM 3: Model Eğitimi (Feature Selection YOK) ---
+    # Kararı Random Forest'a bırakıyoruz.
+    rf = RandomForestClassifier(
+        n_estimators=500,  # Ağaç sayısını artırdık
+        max_depth=7,  # Derinliği biraz artırdık (Daha karmaşık ilişkiler için)
+        min_samples_leaf=4,
+        random_state=42,
+        n_jobs=-1,
+        class_weight='balanced'  # Korkaklığı önlemek için
     )
 
-    model.fit(X_train, y_train,
-              eval_set=[(X_val, y_val)],
-              verbose=False)
-
-    # --- 1. TABLE I Verileri (Metrikler) ---
-    preds = model.predict(X_val)
-
-    acc = accuracy_score(y_val, preds)
-    f1 = f1_score(y_val, preds, average='weighted')
-    prec = precision_score(y_val, preds, average='weighted')
-    rec = recall_score(y_val, preds, average='weighted')
-
-    print("-" * 40)
-    print("TABLE I: PERFORMANCE COMPARISON (DIRECTIONAL)")
-    print("-" * 40)
-    print(f"Accuracy : {acc:.4f}")
-    print(f"F1-Score : {f1:.4f}")
-    print(f"Precision: {prec:.4f}")
-    print(f"Recall   : {rec:.4f}")
-    print("-" * 40)
-
-    # --- 2. FIGURE: Confusion Matrix ---
-    plt.figure(figsize=(8, 6))
-    cm = confusion_matrix(y_val, preds)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Down', 'Up'], yticklabels=['Down', 'Up'])
-    plt.title('Confusion Matrix')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.savefig('results/confusion_matrix.png')
-    plt.close()
-    print("[INFO] 'confusion_matrix.png' results klasörüne kaydedildi.")
-
-    # --- 3. FIGURE: Feature Importance ---
-    if feature_names is not None:
-        plt.figure(figsize=(10, 8))
-        # XGBoost feature importance'ı feature_names ile eşleştir
-        importances = model.feature_importances_
-        indices = np.argsort(importances)[::-1]
-
-        # İlk 20 özelliği göster
-        top_n = 20
-        plt.title('Top 20 Feature Importances')
-        plt.barh(range(top_n), importances[indices[:top_n]], align='center')
-        plt.yticks(range(top_n), [feature_names[i] for i in indices[:top_n]])
-        plt.xlabel('Relative Importance')
-        plt.gca().invert_yaxis()  # En önemlisi en üstte olsun
-        plt.savefig('results/feature_importance.png')
-        plt.close()
-        print("[INFO] 'feature_importance.png' results klasörüne kaydedildi.")
-
-    # Kaydetme
-    os.makedirs('models', exist_ok=True)
-    joblib.dump(model, 'models/xgb_classifier.joblib')
-    return model
-
-
-from tensorflow.keras.layers import Input
-from tensorflow.keras.regularizers import l2
-
-
-# Diğer importlar aynı...
-
-def train_lstm_regressor(X_train_seq, y_train_seq, X_val_seq, y_val_seq, input_shape):
-    """
-    LSTM Regresör - Dengeli ve Optimize Edilmiş Versiyon
-    Veri setine uygun boyutta, ezberlemeyi önleyen yapı.
-    """
-    print("\n[LSTM] Model eğitiliyor (Optimize Mod)...")
-
-    model = Sequential()
-
-    # Giriş Katmanı (Warning düzeltmesi)
-    model.add(Input(shape=input_shape))
-
-    # 1. Katman: Daha makul nöron sayısı + L2 Regularization
-    # kernel_regularizer=l2(0.01) ağırlıkların patlamasını engeller
-    model.add(LSTM(64, return_sequences=True, kernel_regularizer=l2(0.001)))
-    model.add(Dropout(0.4))  # Dropout artırıldı (%40 unutma oranı)
-
-    # 2. Katman
-    model.add(LSTM(32, return_sequences=False, kernel_regularizer=l2(0.001)))
-    model.add(Dropout(0.4))
-
-    # Çıktı Katmanı
-    model.add(Dense(16, activation='relu'))
-    model.add(Dense(1))
-
-    # Optimizer ayarı
-    from tensorflow.keras.optimizers import Adam
-    opt = Adam(learning_rate=0.001)  # Standart hızda başlayalım
-
-    model.compile(optimizer=opt, loss='mean_squared_error')
-
-    # Callbacks
-    early_stop = EarlyStopping(monitor='val_loss', patience=20, restore_best_weights=True, verbose=1)
-    reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5, min_lr=0.00001, verbose=1)
-
-    history = model.fit(X_train_seq, y_train_seq,
-                        validation_data=(X_val_seq, y_val_seq),
-                        batch_size=16,  # 16 çok gürültülü olabilir, 32 standardına dönelim
-                        epochs=100,
-                        callbacks=[early_stop, reduce_lr],
-                        verbose=1)
+    rf.fit(X_train_combined, y_train)
 
     # --- Değerlendirme ---
-    preds = model.predict(X_val_seq)
-    mse = mean_squared_error(y_val_seq, preds)
-    rmse = np.sqrt(mse)
+    preds = rf.predict(X_val_combined)
+    acc = accuracy_score(y_val, preds)
 
     print("-" * 40)
-    print("TABLE II: REGRESSION ERROR METRICS (OPTIMIZED)")
+    print(f"RANDOM FOREST ACCURACY: {acc:.4f}")
     print("-" * 40)
-    print(f"MSE      : {mse:.6f}")
-    print(f"RMSE     : {rmse:.6f}")
-    print("-" * 40)
+    print(classification_report(y_val, preds))
 
-    # --- Grafik ---
-    plt.figure(figsize=(10, 6))
-    plt.plot(history.history['loss'], label='Training Loss')
-    plt.plot(history.history['val_loss'], label='Validation Loss')
-    plt.title('LSTM Model Loss (Optimized)')
-    plt.ylabel('Mean Squared Error')
-    plt.xlabel('Epoch')
-    plt.legend()
-    plt.savefig('results/lstm_loss_curve.png')
+    # --- Feature Importance Grafiği ---
+    importances = rf.feature_importances_
+    indices = np.argsort(importances)[::-1]
+
+    # İlk 20'yi çiz
+    top_n = 20
+    plt.figure(figsize=(10, 8))
+    plt.title('Top 20 Most Important Features')
+    plt.barh(range(top_n), importances[indices[:top_n]], align='center')
+    plt.yticks(range(top_n), [all_feature_names[i] for i in indices[:top_n]])
+    plt.xlabel('Relative Importance')
+    plt.gca().invert_yaxis()
+    plt.tight_layout()
+    plt.savefig('results/rf_feature_importance_full.png')
     plt.close()
 
-    os.makedirs('models', exist_ok=True)
-    model.save('models/lstm_regressor.h5')  # .h5 yerine .keras kullanmak daha iyidir ama şimdilik kalsın
-    return model
+    joblib.dump(rf, 'models/rf_optimized.joblib')
+    return rf
