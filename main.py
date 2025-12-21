@@ -1,3 +1,4 @@
+# Dosya: main.py
 import nltk
 
 nltk.download('wordnet', quiet=True)
@@ -6,170 +7,144 @@ nltk.download('stopwords', quiet=True)
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA  # <--- EKLENDİ
+import joblib
+import os
 
 # Modüller
 from src.data import make_dataset
-from src.features import text_preprocessing, build_features
+from src.features import build_features
 from src.models import train_model
 
 
 def main():
     print("=" * 60)
-    print("PROJE PIPELINE (CORRECT SEQUENCE VERSION)")
+    print("PROJE PIPELINE: PCA + RANDOM FOREST")
     print("=" * 60)
 
     # === ADIM 1: Veri Yükleme ===
     print("[1/6] Veri yükleniyor...")
     raw_df = make_dataset.load_raw_data('data/raw/financial_news_market_events_2025.csv')
+    processed_df = make_dataset.preprocess_data(raw_df).reset_index(drop=True)
 
-    # İndeksi baştan güvenceye alalım
-    processed_df = make_dataset.preprocess_data(raw_df)
-    processed_df = processed_df.reset_index(drop=True)
+    # === ADIM 2: Özellik Mühendisliği ===
+    print("[2/6] Teknik İndikatörler Hazırlanıyor...")
 
-    # === ADIM 2: ÖZELLİK MÜHENDİSLİĞİ (FİLTRELEMEDEN ÖNCE YAPILMALI!) ===
-    # Zaman serisi bozulmadan önce indikatörleri hesaplıyoruz.
-    print("[2/6] Özellikler ekleniyor (Zaman serisi bozulmadan)...")
-
-    # 2.1 Emtia
+    # Teknik Featurelar
     processed_df = build_features.add_commodity_features(processed_df, date_col="Date")
-
-    # 2.2 Teknik İndikatörler (RSI, Volatilite)
     processed_df = build_features.add_technical_indicators(processed_df)
-
-    # 2.3 Lag Özellikleri (Geçmiş günler)
     processed_df = build_features.create_lagged_features(processed_df, 'Index_Change_Percent')
-
-    # 2.4 Keyword / Şirket Taraması
     processed_df = build_features.add_stock_mention_feature(processed_df, out_col="mentions_stock")
     processed_df = build_features.add_company_mention_feature(processed_df)
 
-    # Lag işlemi (shift) yüzünden oluşan ilk satırlardaki NaN'ları temizle
-    processed_df = processed_df.dropna()
-    processed_df = processed_df.reset_index(drop=True)  # İndeksi tazeleyelim
+    # Temizlik
+    processed_df = processed_df.dropna().reset_index(drop=True)
 
-    # === ADIM 3: HEDEF BELİRLEME VE FİLTRELEME ===
-    # === ADIM 3: HEDEF BELİRLEME VE FİLTRELEME ===
-    print("[3/6] Hedef değişkenler ve Filtreleme...")
-
-    # Hedef: Yarının değişimi
+    # Hedef Değişken
     processed_df['Target_Index_Change'] = processed_df['Index_Change_Percent'].shift(-1)
-
-    # NaN olan (son gün) satırını at
     processed_df = processed_df.dropna(subset=['Target_Index_Change'])
 
-    # --- VERİ ANALİZİ ---
-    print("Veri İstatistiği (Tüm Veri):")
-    print(processed_df['Target_Index_Change'].describe())
-
-    # [GÜNCELLEME] SABİT EŞİK DEĞERİ (THRESHOLD)
-    # %0.5 (Yani 0.5) altındaki hareketleri gürültü sayıp atıyoruz.
-    # %3.6 gibi uçuk değerlere gitmiyoruz.
+    # Threshold Filtreleme
     THRESHOLD = 0.5
-
-    abs_change = abs(processed_df['Target_Index_Change'])
-
-    # Filtreleme
-    processed_df = processed_df[abs_change > THRESHOLD]
-
-    # Yön Belirleme
+    processed_df = processed_df[abs(processed_df['Target_Index_Change']) > THRESHOLD]
     processed_df['Target_Direction'] = (processed_df['Target_Index_Change'] > 0).astype(int)
 
-    print(f"Eşik Değeri ({THRESHOLD}) Uygulandı.")
-    print(f"FİLTRE SONRASI Eğitime girecek satır sayısı: {len(processed_df)}")
-    # === ADIM 4: FinBERT Embedding (SENKRONİZASYON GARANTİLİ) ===
-    print("[4/6] FinBERT Embeddingleri hesaplanıyor...")
+    print(f"Eğitime girecek satır sayısı: {len(processed_df)}")
 
-    # DİKKAT: Embedding'i SADECE kalan satırlar için hesaplıyoruz.
+    # === ADIM 3: FinBERT Embedding ===
+    print("[3/6] Embeddingler hesaplanıyor...")
     extractor = build_features.FinbertFeatureExtractor()
 
-    embeddings_list = []
-    sentiments_list = []
-
     headlines = processed_df['Headline'].tolist()
+    embeddings = []
+    sentiments = []
+
     total = len(headlines)
-
-    print(f"Toplam {total} başlık işleniyor...")
-
     for i, text in enumerate(headlines):
-        if i % 100 == 0: print(f"  Processed {i}/{total}")
-        emb = extractor.get_embedding(text)
-        sent = extractor.get_sentiment(text)
-        embeddings_list.append(emb)
-        sentiments_list.append(sent)
+        if i % 200 == 0: print(f"  Embedding: {i}/{total}")
+        embeddings.append(extractor.get_embedding(text))
+        sentiments.append(extractor.get_sentiment(text))
 
-    embeddings = np.array(embeddings_list)
-    processed_df['sentiment'] = sentiments_list
+    embeddings = np.array(embeddings)  # Shape: (N, 768)
+    processed_df['sentiment'] = sentiments
 
-    print(f"Embedding Shape: {embeddings.shape}")
-    print(f"DataFrame Shape: {processed_df.shape}")
+    # === ADIM 4: Veri Bölme (Split) ===
+    print("[4/6] Train/Val Bölümlemesi...")
 
-    assert len(embeddings) == len(processed_df), "HATA: Embedding ve DataFrame satır sayıları tutmuyor!"
-
-    # === ADIM 5: Veri Hazırlığı ===
-    print("[5/6] Veri setleri bölünüyor...")
-
-    # Kronolojik Bölme
-    train_df, val_df, test_df = make_dataset.split_data_chronological(processed_df)
-
-    train_idx = range(0, len(train_df))
-    val_idx = range(len(train_df), len(train_df) + len(val_df))
-
-    # --- HİLE TESTİ (KAPALI) ---
-    # processed_df['CHEAT_CODE'] = processed_df['Target_Index_Change']
-    # ---------------------------
-
-    numeric_cols = [
-        # 'CHEAT_CODE',
-        'Trading_Volume',
-        'Previous_Index_Change_Percent_1d',
-        'Volatility_7d',
-        'RSI_14',
-        'Cumulative_Return_3d',
-        'Gold_close_t1', 'Gold_ret1_t1',
-        'Oil_close_t1', 'Oil_ret1_t1',
-        'keyword_bullish',
-        'keyword_bearish',
-        'mentions_stock'
-    ]
-
-    # Sentiment Dummies
+    # Numeric Features Hazırlığı
     sentiment_dummies = pd.get_dummies(processed_df['sentiment'], prefix='sent')
     processed_df = pd.concat([processed_df, sentiment_dummies], axis=1)
 
-    actual_numeric_cols = [c for c in numeric_cols if c in processed_df.columns]
-    actual_numeric_cols += list(sentiment_dummies.columns)
+    numeric_cols = [
+        'Trading_Volume', 'Previous_Index_Change_Percent_1d', 'Volatility_7d',
+        'RSI_14', 'Cumulative_Return_3d',
+        'Gold_close_t1', 'Gold_ret1_t1', 'Oil_close_t1', 'Oil_ret1_t1',
+        'keyword_bullish', 'keyword_bearish', 'mentions_stock',
+        'sent_negative', 'sent_neutral', 'sent_positive'
+    ]
 
-    X_numeric_all = processed_df[actual_numeric_cols]
+    for col in numeric_cols:
+        if col not in processed_df.columns: processed_df[col] = 0
 
-    # Scaler
+    X_numeric = processed_df[numeric_cols].values
+    y = processed_df['Target_Direction'].values
+
+    # Kronolojik Split
+    split_idx = int(len(processed_df) * 0.8)
+
+    X_num_train = X_numeric[:split_idx]
+    X_emb_train = embeddings[:split_idx]
+    y_train = y[:split_idx]
+
+    X_num_val = X_numeric[split_idx:]
+    X_emb_val = embeddings[split_idx:]
+    y_val = y[split_idx:]
+
+    # === ADIM 5: Scaling ve PCA (Dimension Reduction) ===
+    print("[5/6] PCA ile Boyut İndirgeme (768 -> 50)...")
+
+    # 1. Scaler (Sadece Numeric verilere)
     scaler = StandardScaler()
-    scaler.fit(X_numeric_all.iloc[train_idx])
-    X_numeric_scaled = scaler.transform(X_numeric_all)
+    X_num_train_scaled = scaler.fit_transform(X_num_train)
+    X_num_val_scaled = scaler.transform(X_num_val)
 
-    # Eğitim ve Val Setlerini Ayır
-    X_num_train = X_numeric_scaled[train_idx]
-    X_emb_train = embeddings[train_idx]
-    y_train = processed_df.iloc[train_idx]['Target_Direction'].values
+    # 2. PCA (Sadece Embeddinglere)
+    # 3000 veri için 50 component genelde %90+ varyansı tutar ve overfit engeller.
+    N_COMPONENTS = 50
+    pca = PCA(n_components=N_COMPONENTS, random_state=42)
 
-    X_num_val = X_numeric_scaled[val_idx]
-    X_emb_val = embeddings[val_idx]
-    y_val = processed_df.iloc[val_idx]['Target_Direction'].values
+    # PCA'yi sadece Train setine fit ediyoruz (Data leakage önlemek için)
+    X_emb_train_pca = pca.fit_transform(X_emb_train)
+    X_emb_val_pca = pca.transform(X_emb_val)
 
-    # === ADIM 6: Model Eğitimi ===
-    print("[6/6] Model Eğitimi (Random Forest)...")
-    print(f"Kullanılan özellikler: {actual_numeric_cols}")
+    print(f"  Varyansın ne kadarı korundu?: %{np.sum(pca.explained_variance_ratio_) * 100:.2f}")
 
-    train_model.train_rf_optimized(
-        X_numeric=X_num_train,
-        embeddings=X_emb_train,
+    # 3. Birleştirme (Numeric + PCA Embeddings)
+    X_train_final = np.concatenate([X_num_train_scaled, X_emb_train_pca], axis=1)
+    X_val_final = np.concatenate([X_num_val_scaled, X_emb_val_pca], axis=1)
+
+    print(f"  Eğitim Matrisi Son Boyutu: {X_train_final.shape}")
+    # Beklenen: (Satır, 15 + 50 = 65)
+
+    # === ADIM 6: Model Eğitimi ve Kayıt ===
+    print("[6/6] Model Eğitiliyor...")
+
+    rf_model = train_model.train_rf_optimized(
+        X_train=X_train_final,
         y_train=y_train,
-        X_numeric_val=X_num_val,
-        embeddings_val=X_emb_val,
-        y_val=y_val,
-        feature_names=actual_numeric_cols
+        X_val=X_val_final,
+        y_val=y_val
     )
 
-    print("\nTAMAMLANDI.")
+    if not os.path.exists('models'):
+        os.makedirs('models')
+
+    joblib.dump(rf_model, 'models/rf_model.pkl')
+    joblib.dump(scaler, 'models/scaler.pkl')
+    joblib.dump(pca, 'models/pca.pkl')  # <--- PCA'Yİ KAYDETMEYİ UNUTMUYORUZ
+
+    print("\nBAŞARILI! Model ve PCA kaydedildi.")
+    print("models/rf_model.pkl, models/scaler.pkl, models/pca.pkl")
 
 
 if __name__ == "__main__":
