@@ -8,32 +8,62 @@ from src.data.market_data import get_daily_close
 
 class FinbertFeatureExtractor:
     """
-    FinBERT kullanarak duygu ve embedding çıkaran sınıf.
+    FinBERT kullanarak:
+    - Sentiment probability
+    - Mean + Max pooled embedding
+    üreten sınıf.
     """
 
     def __init__(self, model_name="ProsusAI/finbert"):
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.sentiment_model = AutoModelForSequenceClassification.from_pretrained(model_name)
         self.embedding_model = AutoModel.from_pretrained(model_name)
+
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.sentiment_model.to(self.device)
         self.embedding_model.to(self.device)
 
-    def get_sentiment(self, text: str) -> str:
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        self.sentiment_labels = list(self.sentiment_model.config.id2label.values())
+
+    def get_sentiment_scores(self, text: str) -> dict:
+        """
+        {'positive': p1, 'neutral': p2, 'negative': p3}
+        """
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
         with torch.no_grad():
             logits = self.sentiment_model(**inputs).logits
-        scores = {k: v for k, v in
-                  zip(self.sentiment_model.config.id2label.values(), torch.softmax(logits[0], dim=0).tolist())}
-        return max(scores, key=scores.get)
+
+        probs = torch.softmax(logits[0], dim=0).cpu().numpy()
+        return dict(zip(self.sentiment_labels, probs))
 
     def get_embedding(self, text: str) -> np.ndarray:
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512).to(self.device)
+        """
+        Mean + Max Pooling
+        Output shape: (1536,)
+        """
+        inputs = self.tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512
+        ).to(self.device)
+
         with torch.no_grad():
             outputs = self.embedding_model(**inputs)
-        cls_embedding = outputs.last_hidden_state[0, 0, :].cpu().numpy()
-        return cls_embedding
 
+        token_embeddings = outputs.last_hidden_state[0]  # (seq_len, 768)
+
+        mean_pool = token_embeddings.mean(dim=0)
+        max_pool = token_embeddings.max(dim=0).values
+
+        final_embedding = torch.cat([mean_pool, max_pool], dim=0)
+        return final_embedding.cpu().numpy()
 
 def create_lagged_features(df: pd.DataFrame, col_name: str, lag_days: int = 1) -> pd.DataFrame:
     df[f'Previous_{col_name}_{lag_days}d'] = df[col_name].shift(lag_days)

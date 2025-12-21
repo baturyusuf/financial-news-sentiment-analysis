@@ -15,17 +15,17 @@ st.set_page_config(page_title="FinAI - Sentiment & Prediction", layout="wide")
 @st.cache_resource
 def load_resources():
     try:
-        model = joblib.load('models/rf_model.pkl')
+        model = joblib.load('models/xgb_model.pkl')
         scaler = joblib.load('models/scaler.pkl')
-        pca = joblib.load('models/pca.pkl')  # <--- PCA YÜKLENİYOR
+        # pca = joblib.load('models/pca.pkl')  # <--- PCA YÜKLENİYOR
         extractor = build_features.FinbertFeatureExtractor()
-        return model, scaler, pca, extractor
+        return model, scaler, extractor
     except Exception as e:
         st.error(f"Model dosyaları eksik! Önce 'python main.py' çalıştırın. Hata: {e}")
         return None, None, None, None
 
 
-rf_model, scaler, pca, feature_extractor = load_resources()
+rf_model, scaler, feature_extractor = load_resources()
 
 # === SIDEBAR ===
 st.sidebar.title("FinAI Panel")
@@ -92,11 +92,12 @@ else:
                             f"Model, piyasa yönünü tahmin etmek için en güncel haberi ({latest_news['title']}) ve teknik verileri kullanıyor.")
 
                         # 2. Embedding ve Sentiment
-                        raw_embedding = feature_extractor.get_embedding(latest_news['title'])
-                        sentiment = feature_extractor.get_sentiment(latest_news['title'])
+                        # raw_embedding = feature_extractor.get_embedding(latest_news['title'])
+                        sent_scores = feature_extractor.get_sentiment_scores(latest_news['title'])
+                        sentiment_label = max(sent_scores, key=sent_scores.get)
 
                         # 3. PCA İŞLEMİ
-                        embedding_pca = pca.transform(raw_embedding.reshape(1, -1))
+                        embedding = feature_extractor.get_embedding(latest_news['title']).reshape(1, -1)
 
                         # 4. Teknik Verileri Hazırla
                         processed_df = df.copy().reset_index()
@@ -114,9 +115,9 @@ else:
                         latest_data['mentions_stock'] = 1
                         latest_data['Previous_Index_Change_Percent_1d'] = processed_df['Index_Change_Percent'].iloc[-2]
 
-                        latest_data['sent_positive'] = 1 if sentiment == 'positive' else 0
-                        latest_data['sent_negative'] = 1 if sentiment == 'negative' else 0
-                        latest_data['sent_neutral'] = 1 if sentiment == 'neutral' else 0
+                        latest_data['sent_positive'] = sent_scores['positive']
+                        latest_data['sent_negative'] = sent_scores['negative']
+                        latest_data['sent_neutral'] = sent_scores['neutral']
 
                         cols = [
                             'Trading_Volume', 'Previous_Index_Change_Percent_1d', 'Volatility_7d',
@@ -133,7 +134,7 @@ else:
                         X_numeric = latest_data[cols].values
                         X_numeric_scaled = scaler.transform(X_numeric)
 
-                        X_final = np.concatenate([X_numeric_scaled, embedding_pca], axis=1)
+                        X_final = np.concatenate([X_numeric_scaled, embedding], axis=1)
 
                         # 6. Tahmin
                         pred = rf_model.predict(X_final)[0]
@@ -142,8 +143,16 @@ else:
                         col_res1, col_res2 = st.columns(2)
 
                         with col_res1:
-                            color = "green" if sentiment == "positive" else "red" if sentiment == "negative" else "gray"
-                            st.metric("Haber Duygusu", sentiment.upper())
+                            color = (
+                                "green" if sentiment_label == "positive"
+                                else "red" if sentiment_label == "negative"
+                                else "gray"
+                            )
+                            st.metric(
+                                "Haber Duygusu",
+                                sentiment_label.upper(),
+                                f"pos={sent_scores['positive']:.2f} | neg={sent_scores['negative']:.2f}"
+                            )
 
                         with col_res2:
                             if pred == 1:
