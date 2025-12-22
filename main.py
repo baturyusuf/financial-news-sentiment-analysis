@@ -263,14 +263,30 @@ def main():
     panel["return_1d"] = panel.groupby("Market_Index")["Index_Change_Percent"].shift(-1)
     panel = panel.dropna(subset=["return_1d"]).reset_index(drop=True)
 
-    THRESHOLD = 0.2
-    r = panel["return_1d"]
+    # --- Adaptive (volatility-scaled) neutral-drop labeling ---
+    # roll_std_10 zaten add_return_dynamics() içinde shift(1) ile üretildiği için leakage yapmaz.
+    K_VOL = 0.90  # 0.70 / 0.90 / 1.10 gibi değerlerle deneyebilirsin
+    MIN_THR = 0.15  # taban eşik: çok küçük threshold'ları engeller
+
+    if "roll_std_10" not in panel.columns:
+        # Güvenlik: eğer kolon yoksa üret (tamamen geçmişe dayalı)
+        panel["roll_std_10"] = panel.groupby("Market_Index")["Index_Change_Percent"].transform(
+            lambda s: s.shift(1).rolling(window=10).std()
+        ).fillna(0.0)
+
+    thr_vec = np.maximum(MIN_THR, K_VOL * panel["roll_std_10"].astype(float))
+    r = panel["return_1d"].astype(float)
+
     panel["Target_Direction"] = np.where(
-        r > THRESHOLD, 1,
-        np.where(r < -THRESHOLD, 0, np.nan)
+        r > thr_vec, 1,
+        np.where(r < -thr_vec, 0, np.nan)
     )
+
+    before = len(panel)
     panel = panel.dropna(subset=["Target_Direction"]).reset_index(drop=True)
     panel["Target_Direction"] = panel["Target_Direction"].astype(int)
+
+    print(f"Adaptive labeling: kept {len(panel)}/{before} rows | K_VOL={K_VOL} MIN_THR={MIN_THR}")
 
     print(f"Eğitime girecek günlük satır sayısı: {len(panel)}")
     print(panel["Target_Direction"].value_counts(normalize=True))
