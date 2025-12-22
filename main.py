@@ -17,7 +17,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-# Modüller
 from src.data import make_dataset
 from src.features import build_features
 from src.models import train_model
@@ -37,7 +36,6 @@ def mode_or_nan(s: pd.Series):
 
 
 def _sig_from_headlines(headlines: list[str]) -> str:
-    """Cache signature: length + first/last headline hash."""
     if len(headlines) == 0:
         raw = "0||"
     else:
@@ -47,8 +45,8 @@ def _sig_from_headlines(headlines: list[str]) -> str:
 
 def compute_or_load_row_finbert(df: pd.DataFrame, cache_dir="data/processed"):
     """
-    Satır-bazında (raw rows) FinBERT embedding(768) + sentiment(pos/neg/neu/conf) üretir.
-    Cache varsa ve uzunluk+signature uyuyorsa yükler.
+    Satır-bazında FinBERT embedding(768) + sentiment(pos/neg/neu/conf) üretir.
+    Cache varsa ve signature+length uyuyorsa yükler.
     """
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -88,12 +86,11 @@ def compute_or_load_row_finbert(df: pd.DataFrame, cache_dir="data/processed"):
     for i, text in enumerate(headlines):
         if i % 200 == 0:
             print(f"  {i}/{n}")
-        # embedding (768)
-        e = extractor.get_embedding(text)
+
+        e = extractor.get_embedding(text)  # (768,)
         emb_list.append(e)
 
         s = extractor.get_sentiment_scores(text)
-        # label casing robust
         s_lower = {str(k).lower(): float(v) for k, v in s.items()} if isinstance(s, dict) else {}
         pos = s_lower.get("positive", 0.0)
         neg = s_lower.get("negative", 0.0)
@@ -121,11 +118,11 @@ def compute_or_load_row_finbert(df: pd.DataFrame, cache_dir="data/processed"):
 
 def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu, conf) -> pd.DataFrame:
     """
-    Market_Index x DateOnly bazında günlük panel:
-    - Numeric agregasyon: mean/sum
-    - Keyword flags: max
-    - Sentiment: mean/max/min/std + conf mean/max
-    - Embedding: mean pooling (768)
+    Market_Index x DateOnly günlük panel:
+      - Numeric: mean/sum
+      - Keyword: max
+      - Sentiment: mean/max/min/std
+      - Embedding: mean pooling + (opsiyonel) std_mean
     """
     rows = []
     g = df.groupby(["Market_Index", "DateOnly"], sort=False)
@@ -135,7 +132,9 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
         if len(idx) == 0:
             continue
 
-        emb_mean = row_emb[idx].mean(axis=0)
+        emb_block = row_emb[idx]
+        emb_mean = emb_block.mean(axis=0)
+        emb_std_mean = float(emb_block.std(axis=0).mean()) if len(idx) > 1 else 0.0
 
         sent_score = (pos[idx] - neg[idx])
         sent_score_mean = float(np.mean(sent_score))
@@ -147,7 +146,6 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
             "Market_Index": midx,
             "Date": dateonly,
             "News_Count": int(len(idx)),
-            # İsterseniz debug için concat tutabilirsiniz (FinBERT için kullanılmıyor)
             "Headline_Concat": " [SEP] ".join([t for t in sub["Headline"].astype(str).tolist() if t])[:4000],
 
             "Index_Change_Percent": float(sub["Index_Change_Percent"].mean()) if "Index_Change_Percent" in sub else 0.0,
@@ -158,35 +156,65 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
             "Sector": mode_or_nan(sub["Sector"]) if "Sector" in sub else "UNKNOWN",
             "Impact_Level": mode_or_nan(sub["Impact_Level"]) if "Impact_Level" in sub else "UNKNOWN",
 
-            # keyword flags (satır bazında üretildi -> günlük max)
             "keyword_bullish": int(sub["keyword_bullish"].max()) if "keyword_bullish" in sub else 0,
             "keyword_bearish": int(sub["keyword_bearish"].max()) if "keyword_bearish" in sub else 0,
             "mentions_stock": int(sub["mentions_stock"].max()) if "mentions_stock" in sub else 0,
 
-            # sentiment agregasyon
             "sent_pos_mean": float(np.mean(pos[idx])),
             "sent_neg_mean": float(np.mean(neg[idx])),
             "sent_neu_mean": float(np.mean(neu[idx])),
             "sent_conf_mean": float(np.mean(conf[idx])),
             "sent_conf_max": float(np.max(conf[idx])),
+
             "sent_score_mean": sent_score_mean,
             "sent_score_max": sent_score_max,
             "sent_score_min": sent_score_min,
             "sent_score_std": sent_score_std,
 
-            # embedding (object column)
             "emb_mean": emb_mean,
+            "emb_std_mean": emb_std_mean,
         }
         rows.append(row)
 
-    panel = pd.DataFrame(rows)
+    panel = pd.DataFrame(rows).sort_values(["Market_Index", "Date"]).reset_index(drop=True)
+    return panel
+
+
+def add_return_dynamics(panel: pd.DataFrame) -> pd.DataFrame:
+    """
+    Next-day için en kritik sinyaller: ret_t0, multi-lag, rolling mean/std.
+    Tüm rolling'ler shift(1) ile yapılır (tamamen geçmişe dayalı).
+    """
     panel = panel.sort_values(["Market_Index", "Date"]).reset_index(drop=True)
+
+    # takvim
+    panel["dow"] = panel["Date"].dt.dayofweek.astype(int)
+    panel["month"] = panel["Date"].dt.month.astype(int)
+
+    # bugünün return'ü (t0)
+    panel["ret_t0"] = panel["Index_Change_Percent"].astype(float)
+
+    # lag returns
+    for lag in [1, 2, 3, 5]:
+        panel[f"lag_ret_{lag}"] = (
+            panel.groupby("Market_Index")["Index_Change_Percent"].shift(lag).fillna(0.0)
+        )
+
+    # rolling stats (shift(1) ile)
+    for w in [3, 5, 10, 20]:
+        panel[f"roll_mean_{w}"] = panel.groupby("Market_Index")["Index_Change_Percent"].transform(
+            lambda s: s.shift(1).rolling(window=w).mean()
+        ).fillna(0.0)
+        panel[f"roll_std_{w}"] = panel.groupby("Market_Index")["Index_Change_Percent"].transform(
+            lambda s: s.shift(1).rolling(window=w).std()
+        ).fillna(0.0)
+
     return panel
 
 
 def main():
     print("=" * 60)
-    print("PROJE PIPELINE: XGBOOST + FINBERT (ROW-AGG) + DAILY PANEL + SVD64 (NEXT-DAY)")
+    print("PROJE PIPELINE: XGBOOST + FINBERT (ROW-AGG) + DAILY PANEL + SVD64 + RETURN-DYNAMICS (NEXT-DAY)")
     print("=" * 60)
 
     # === ADIM 1: Veri Yükleme ===
@@ -194,31 +222,27 @@ def main():
     raw_df = make_dataset.load_raw_data("data/raw/financial_news_market_events_2025.csv")
     df = make_dataset.preprocess_data(raw_df).reset_index(drop=True)
 
-    # Date temizliği
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.tz_localize(None)
     df = df.dropna(subset=["Date", "Market_Index"]).reset_index(drop=True)
     df["DateOnly"] = df["Date"].dt.normalize()
-
-    # Headline temizliği
     df["Headline"] = df["Headline"].fillna("").astype(str)
 
-    # Keyword flags (satır bazında) -> sonra günlük max alacağız
+    # satır bazında keyword
     df = build_features.add_stock_mention_feature(df, headline_col="Headline")
     df = build_features.add_company_mention_feature(df)
 
-    # === ADIM 2: Row-level FinBERT cache/compute ===
+    # === ADIM 2: Row-level FinBERT ===
     print("[2/7] Row-level FinBERT embedding/sentiment...")
     row_emb, pos, neg, neu, conf = compute_or_load_row_finbert(df)
 
-    # === ADIM 3: Günlük panel + FinBERT agregasyon ===
-    print("[3/7] Daily panel + FinBERT aggregation (no truncation)...")
+    # === ADIM 3: Daily panel + agregasyon ===
+    print("[3/7] Daily panel + FinBERT aggregation...")
     panel = build_daily_panel_with_finbert_agg(df, row_emb, pos, neg, neu, conf)
 
-    # === ADIM 4: Commodity + Technical (Market_Index bazında) ===
-    print("[4/7] Commodity + Technical indicators...")
+    # === ADIM 4: Commodity + Technical + Return dynamics ===
+    print("[4/7] Commodity + Technical indicators + return dynamics...")
     panel = build_features.add_commodity_features(panel, date_col="Date")
 
-    # Teknik indikatörleri Market_Index bazında üret (apply warning yerine loop)
     out = []
     for midx, g in panel.groupby("Market_Index", sort=False):
         g = g.sort_values("Date").reset_index(drop=True)
@@ -226,10 +250,13 @@ def main():
         out.append(g)
     panel = pd.concat(out, ignore_index=True).sort_values(["Market_Index", "Date"]).reset_index(drop=True)
 
-    # Lag (Market_Index bazında)
+    # lag1 (mevcut projede kullanılan isim)
     panel["Previous_Index_Change_Percent_1d"] = (
         panel.groupby("Market_Index")["Index_Change_Percent"].shift(1).fillna(0.0)
     )
+
+    # ek dinamik feature'lar
+    panel = add_return_dynamics(panel)
 
     # === ADIM 5: Target (Next-day) ===
     print("[5/7] Target (next-day) oluşturuluyor...")
@@ -248,11 +275,12 @@ def main():
     print(f"Eğitime girecek günlük satır sayısı: {len(panel)}")
     print(panel["Target_Direction"].value_counts(normalize=True))
 
-    # Embedding matrisi (768) — panel filtrelerinden sonra
+    # embedding matrisi
     emb_matrix = np.vstack(panel["emb_mean"].to_numpy())
 
     # === FEATURE SET ===
     numeric_cols = [
+        # base numeric
         "Trading_Volume",
         "Previous_Index_Change_Percent_1d",
         "Volatility_7d",
@@ -267,7 +295,7 @@ def main():
         "mentions_stock",
         "News_Count",
 
-        # sentiment aggregation (multi-headline)
+        # sentiment aggregation
         "sent_pos_mean",
         "sent_neg_mean",
         "sent_neu_mean",
@@ -277,6 +305,28 @@ def main():
         "sent_score_max",
         "sent_score_min",
         "sent_score_std",
+
+        # embedding disagreement
+        "emb_std_mean",
+
+        # return dynamics
+        "ret_t0",
+        "lag_ret_1",
+        "lag_ret_2",
+        "lag_ret_3",
+        "lag_ret_5",
+        "roll_mean_3",
+        "roll_mean_5",
+        "roll_mean_10",
+        "roll_mean_20",
+        "roll_std_3",
+        "roll_std_5",
+        "roll_std_10",
+        "roll_std_20",
+
+        # calendar
+        "dow",
+        "month",
     ]
 
     for c in numeric_cols:
@@ -295,23 +345,19 @@ def main():
     # === DATE-BASED SPLIT (OUT-OF-TIME) ===
     unique_dates = np.sort(panel["Date"].unique())
     cutoff_date = unique_dates[int(len(unique_dates) * 0.8)]
-
     train_mask = panel["Date"] <= cutoff_date
     val_mask = panel["Date"] > cutoff_date
 
     X_num_train = X_numeric[train_mask]
     X_num_val = X_numeric[val_mask]
-
     X_cat_train = panel.loc[train_mask, cat_cols].values
     X_cat_val = panel.loc[val_mask, cat_cols].values
-
     X_emb_train = emb_matrix[train_mask.to_numpy()]
     X_emb_val = emb_matrix[val_mask.to_numpy()]
-
     y_train = y[train_mask]
     y_val = y[val_mask]
 
-    # === ADIM 6: Scaling + OHE + SVD64 ===
+    # === ADIM 6: Scaling + OHE + SVD ===
     print("[6/7] Scaling + OHE + SVD(64) + concat...")
     scaler = StandardScaler()
     X_num_train_scaled = scaler.fit_transform(X_num_train)
@@ -325,12 +371,13 @@ def main():
     X_cat_train_ohe = ohe.fit_transform(X_cat_train)
     X_cat_val_ohe = ohe.transform(X_cat_val)
 
-    svd = TruncatedSVD(n_components=64, random_state=42)
-    X_emb_train_64 = svd.fit_transform(X_emb_train)
-    X_emb_val_64 = svd.transform(X_emb_val)
+    SVD_DIM = 64
+    svd = TruncatedSVD(n_components=SVD_DIM, random_state=42)
+    X_emb_train_k = svd.fit_transform(X_emb_train)
+    X_emb_val_k = svd.transform(X_emb_val)
 
-    X_train_final = np.concatenate([X_num_train_scaled, X_cat_train_ohe, X_emb_train_64], axis=1)
-    X_val_final = np.concatenate([X_num_val_scaled, X_cat_val_ohe, X_emb_val_64], axis=1)
+    X_train_final = np.concatenate([X_num_train_scaled, X_cat_train_ohe, X_emb_train_k], axis=1)
+    X_val_final = np.concatenate([X_num_val_scaled, X_cat_val_ohe, X_emb_val_k], axis=1)
 
     print(f"Eğitim Matrisi Son Boyutu: {X_train_final.shape}")
     print(f"Validation Matrisi Son Boyutu: {X_val_final.shape}")
@@ -344,7 +391,7 @@ def main():
         y_val=y_val
     )
 
-    # === VALIDATION: Threshold tuning + rapor ===
+    # === VALIDATION ===
     val_probs = xgb_model.predict_proba(X_val_final)[:, 1]
 
     pr_auc = average_precision_score(y_val, val_probs)
@@ -369,7 +416,7 @@ def main():
     print("\n[Validation] Classification Report (best thr)")
     print(classification_report(y_val, val_pred_best, target_names=["Down", "Up"]))
 
-    # === MODELLERİ KAYDET ===
+    # === SAVE ===
     os.makedirs("models", exist_ok=True)
     joblib.dump(best["thr"], "models/threshold.pkl")
     joblib.dump(xgb_model, "models/xgb_model.pkl")
