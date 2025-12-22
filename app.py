@@ -13,19 +13,23 @@ st.set_page_config(page_title="FinAI - Sentiment & Prediction", layout="wide")
 
 # === CACHE MEKANİZMASI ===
 @st.cache_resource
+@st.cache_resource
 def load_resources():
     try:
         model = joblib.load('models/xgb_model.pkl')
         scaler = joblib.load('models/scaler.pkl')
         numeric_cols = joblib.load('models/numeric_cols.pkl')
+        cat_cols = joblib.load('models/cat_cols.pkl')
+        ohe = joblib.load('models/ohe.pkl')
+        svd = joblib.load('models/svd.pkl')
         threshold = joblib.load('models/threshold.pkl')
         extractor = build_features.FinbertFeatureExtractor()
-        return model, scaler, extractor, numeric_cols, threshold
+        return model, scaler, extractor, numeric_cols, cat_cols, ohe, svd, threshold
     except Exception as e:
         st.error(f"Model dosyaları eksik! Önce 'python main.py' çalıştırın. Hata: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None, None
 
-xgb_model, scaler, feature_extractor, numeric_cols, threshold = load_resources()
+xgb_model, scaler, feature_extractor, numeric_cols, cat_cols, ohe, svd, threshold = load_resources()
 
 # === SIDEBAR ===
 st.sidebar.title("FinAI Panel")
@@ -155,12 +159,65 @@ else:
                         X_numeric_scaled = scaler.transform(X_numeric)
 
                         # Embedding (1536) + numeric (14) -> 1550
-                        X_final = np.concatenate([X_numeric_scaled, embedding], axis=1)
+                        # --- 0) yfinance Volume -> Trading_Volume hizalama ---
+                        if "Volume" in processed_df.columns and "Trading_Volume" not in processed_df.columns:
+                            processed_df["Trading_Volume"] = processed_df["Volume"]
 
-                        # --- 5) Tahmin: threshold ile karar ver ---
+                        # --- 1) keyword/mentions ---
+                        tmp = pd.DataFrame({"Headline": [latest_news["title"]]})
+                        tmp = build_features.add_stock_mention_feature(tmp, headline_col="Headline")
+
+                        latest_data["keyword_bullish"] = int(tmp.loc[0, "keyword_bullish"])
+                        latest_data["keyword_bearish"] = int(tmp.loc[0, "keyword_bearish"])
+                        latest_data["mentions_stock"] = int(tmp.loc[0, "mentions_stock"])
+
+                        # --- 2) sentiment aggregation (tek haber -> mean=max=min, std=0) ---
+                        sent_scores = feature_extractor.get_sentiment_scores(latest_news["title"])
+                        s_lower = {str(k).lower(): float(v) for k, v in sent_scores.items()} if isinstance(sent_scores,
+                                                                                                           dict) else {}
+                        pos = s_lower.get("positive", 0.0)
+                        neg = s_lower.get("negative", 0.0)
+                        neu = s_lower.get("neutral", 0.0)
+                        conf = max(s_lower.values()) if len(s_lower) else 0.0
+                        score = pos - neg
+
+                        latest_data["sent_pos_mean"] = float(pos)
+                        latest_data["sent_neg_mean"] = float(neg)
+                        latest_data["sent_neu_mean"] = float(neu)
+                        latest_data["sent_conf_mean"] = float(conf)
+                        latest_data["sent_conf_max"] = float(conf)
+                        latest_data["sent_score_mean"] = float(score)
+                        latest_data["sent_score_max"] = float(score)
+                        latest_data["sent_score_min"] = float(score)
+                        latest_data["sent_score_std"] = 0.0
+
+                        # News_Count (tek haber)
+                        latest_data["News_Count"] = 1
+
+                        # --- 3) Embedding (768) -> SVD(64) ---
+                        emb_768 = feature_extractor.get_embedding(latest_news["title"]).reshape(1, -1)
+                        emb_64 = svd.transform(emb_768)
+
+                        # --- 4) Numeric kolonları tamamla ---
+                        for c in numeric_cols:
+                            if c not in latest_data.columns:
+                                latest_data[c] = 0.0
+
+                        X_num = latest_data[numeric_cols].values.astype(float)
+                        X_num_scaled = scaler.transform(X_num)
+
+                        # --- 5) Categoricals (demo: UNKNOWN) ---
+                        cat_row = pd.DataFrame({c: ["UNKNOWN"] for c in cat_cols}).values
+                        X_cat_ohe = ohe.transform(cat_row)
+
+                        # --- 6) Final concat ---
+                        X_final = np.concatenate([X_num_scaled, X_cat_ohe, emb_64], axis=1)
+
+                        # --- 7) Predict ---
                         p_up = float(xgb_model.predict_proba(X_final)[0, 1])
                         pred = 1 if p_up >= float(threshold) else 0
 
+                        # --- 5) Tahmin: threshold ile karar ver ---
                         col_res1, col_res2 = st.columns(2)
 
                         with col_res1:
