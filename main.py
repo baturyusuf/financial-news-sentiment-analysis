@@ -35,11 +35,39 @@ def mode_or_nan(s: pd.Series):
     return s.value_counts().idxmax()
 
 
+def search_best_threshold(y_true: np.ndarray, prob: np.ndarray, objective: str = "mcc"):
+    """
+    objective: "mcc" or "bacc"
+    Returns dict: {"thr","score","bacc","mcc"}
+    """
+    objective = (objective or "mcc").lower().strip()
+    best = None
+
+    for thr in np.linspace(0.05, 0.95, 91):
+        pred = (prob >= thr).astype(int)
+        bacc = float(balanced_accuracy_score(y_true, pred))
+        mcc = float(matthews_corrcoef(y_true, pred))
+
+        if objective in ("mcc", "matthews"):
+            score = mcc
+        else:
+            score = bacc
+
+        if best is None or score > best["score"]:
+            best = {"thr": float(thr), "score": float(score), "bacc": bacc, "mcc": mcc}
+
+    return best
+
+
 def _sig_from_headlines(headlines: list[str]) -> str:
-    if len(headlines) == 0:
-        raw = "0||"
-    else:
-        raw = f"{len(headlines)}||{headlines[0]}||{headlines[-1]}"
+    """
+    Cache signature: length + first/last 25 headlines.
+    (Hızlı ve pratik; tüm dataset'i hashlemiyoruz.)
+    """
+    n = len(headlines)
+    head = headlines[:25]
+    tail = headlines[-25:] if n >= 25 else headlines
+    raw = "||".join([str(n)] + head + ["<MID>"] + tail)
     return hashlib.md5(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
@@ -122,7 +150,7 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
       - Numeric: mean/sum
       - Keyword: max
       - Sentiment: mean/max/min/std
-      - Embedding: mean pooling + (opsiyonel) std_mean
+      - Embedding: mean pooling + disagreement (std mean)
     """
     rows = []
     g = df.groupby(["Market_Index", "DateOnly"], sort=False)
@@ -144,7 +172,7 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
 
         row = {
             "Market_Index": midx,
-            "Date": dateonly,
+            "Date": pd.to_datetime(dateonly).tz_localize(None),
             "News_Count": int(len(idx)),
             "Headline_Concat": " [SEP] ".join([t for t in sub["Headline"].astype(str).tolist() if t])[:4000],
 
@@ -171,8 +199,8 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
             "sent_score_min": sent_score_min,
             "sent_score_std": sent_score_std,
 
-            "emb_mean": emb_mean,
-            "emb_std_mean": emb_std_mean,
+            "emb_mean": emb_mean,          # ndarray(768,)
+            "emb_std_mean": emb_std_mean,  # float
         }
         rows.append(row)
 
@@ -182,25 +210,21 @@ def build_daily_panel_with_finbert_agg(df: pd.DataFrame, row_emb, pos, neg, neu,
 
 def add_return_dynamics(panel: pd.DataFrame) -> pd.DataFrame:
     """
-    Next-day için en kritik sinyaller: ret_t0, multi-lag, rolling mean/std.
-    Tüm rolling'ler shift(1) ile yapılır (tamamen geçmişe dayalı).
+    Next-day için kritik sinyaller: ret_t0, multi-lag, rolling mean/std.
+    Rolling'ler shift(1) ile yapılır (tamamen geçmişe dayalı).
     """
     panel = panel.sort_values(["Market_Index", "Date"]).reset_index(drop=True)
 
-    # takvim
     panel["dow"] = panel["Date"].dt.dayofweek.astype(int)
     panel["month"] = panel["Date"].dt.month.astype(int)
 
-    # bugünün return'ü (t0)
     panel["ret_t0"] = panel["Index_Change_Percent"].astype(float)
 
-    # lag returns
     for lag in [1, 2, 3, 5]:
         panel[f"lag_ret_{lag}"] = (
             panel.groupby("Market_Index")["Index_Change_Percent"].shift(lag).fillna(0.0)
         )
 
-    # rolling stats (shift(1) ile)
     for w in [3, 5, 10, 20]:
         panel[f"roll_mean_{w}"] = panel.groupby("Market_Index")["Index_Change_Percent"].transform(
             lambda s: s.shift(1).rolling(window=w).mean()
@@ -212,10 +236,110 @@ def add_return_dynamics(panel: pd.DataFrame) -> pd.DataFrame:
     return panel
 
 
+def fit_eval_once(panel: pd.DataFrame,
+                  emb_matrix: np.ndarray,
+                  numeric_cols: list[str],
+                  cat_cols: list[str],
+                  train_mask: np.ndarray,
+                  val_mask: np.ndarray,
+                  svd_dim: int = 64,
+                  seed: int = 42,
+                  thr_objective: str = "mcc"):
+    """
+    Tek bir train/val split üzerinde:
+      - scaler + OHE + SVD(emb) fit sadece train'de
+      - XGB train
+      - threshold search (thr_objective: mcc/bacc)
+    """
+    X_numeric = panel[numeric_cols].values.astype(float)
+    X_cat = panel[cat_cols].values
+    y = panel["Target_Direction"].values.astype(int)
+
+    Xn_tr, Xn_va = X_numeric[train_mask], X_numeric[val_mask]
+    Xc_tr, Xc_va = X_cat[train_mask], X_cat[val_mask]
+    Xe_tr, Xe_va = emb_matrix[train_mask], emb_matrix[val_mask]
+    y_tr, y_va = y[train_mask], y[val_mask]
+
+    scaler = StandardScaler()
+    Xn_tr_s = scaler.fit_transform(Xn_tr)
+    Xn_va_s = scaler.transform(Xn_va)
+
+    try:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    Xc_tr_o = ohe.fit_transform(Xc_tr)
+    Xc_va_o = ohe.transform(Xc_va)
+
+    svd = TruncatedSVD(n_components=svd_dim, random_state=seed)
+    Xe_tr_k = svd.fit_transform(Xe_tr)
+    Xe_va_k = svd.transform(Xe_va)
+
+    X_tr = np.concatenate([Xn_tr_s, Xc_tr_o, Xe_tr_k], axis=1)
+    X_va = np.concatenate([Xn_va_s, Xc_va_o, Xe_va_k], axis=1)
+
+    xgb_model = train_model.train_xgb(
+        X_train=X_tr,
+        y_train=y_tr,
+        X_val=X_va,
+        y_val=y_va
+    )
+
+    va_prob = xgb_model.predict_proba(X_va)[:, 1]
+    pr_auc = float(average_precision_score(y_va, va_prob))
+    roc_auc = float(roc_auc_score(y_va, va_prob))
+
+    best = search_best_threshold(y_va, va_prob, objective=thr_objective)
+
+    va_pred_best = (va_prob >= best["thr"]).astype(int)
+    cm = confusion_matrix(y_va, va_pred_best)
+
+    metrics = {
+        "PR_AUC": pr_auc,
+        "ROC_AUC": roc_auc,
+        "BalancedAcc": float(best["bacc"]),
+        "MCC": float(best["mcc"]),
+        "thr": float(best["thr"]),
+        "val_n": int(val_mask.sum()),
+        "cm": cm,
+    }
+
+    artifacts = {
+        "model": xgb_model,
+        "scaler": scaler,
+        "ohe": ohe,
+        "svd": svd,
+    }
+
+    return metrics, artifacts, (y_va, va_pred_best)
+
+
 def main():
     print("=" * 60)
-    print("PROJE PIPELINE: XGBOOST + FINBERT (ROW-AGG) + DAILY PANEL + SVD64 + RETURN-DYNAMICS (NEXT-DAY)")
+    print("PROJE PIPELINE: XGBOOST + FINBERT (ROW-AGG) + DAILY PANEL + SVD + RETURN-DYNAMICS (NEXT-DAY)")
     print("=" * 60)
+
+    # -----------------------------
+    # Config (ENV)
+    # -----------------------------
+    SAVE_MODELS = os.getenv("SAVE_MODELS", "1") == "1"
+    CUTOFF_FRAC = float(os.getenv("CUTOFF_FRAC", "0.80"))
+    SVD_DIM = int(os.getenv("SVD_DIM", "64"))
+
+    CV_MODE = os.getenv("CV_MODE", "0") == "1"
+    CV_POINTS_STR = os.getenv("CV_POINTS", "0.60,0.70,0.80,0.90")
+    CV_POINTS = [float(x.strip()) for x in CV_POINTS_STR.split(",") if x.strip()]
+
+    K_VOL = float(os.getenv("K_VOL", "0.90"))
+    MIN_THR = float(os.getenv("MIN_THR", "0.15"))
+
+    THR_OBJECTIVE = os.getenv("THR_OBJECTIVE", "mcc").strip().lower()
+
+    print(f"[CFG] SAVE_MODELS={int(SAVE_MODELS)} | CUTOFF_FRAC={CUTOFF_FRAC} | SVD_DIM={SVD_DIM}")
+    print(f"[CFG] CV_MODE={int(CV_MODE)} | CV_POINTS={CV_POINTS}")
+    print(f"[CFG] Adaptive labeling: K_VOL={K_VOL} | MIN_THR={MIN_THR}")
+    print(f"[CFG] THR_OBJECTIVE={THR_OBJECTIVE}")
 
     # === ADIM 1: Veri Yükleme ===
     print("[1/7] Veri yükleniyor...")
@@ -263,13 +387,8 @@ def main():
     panel["return_1d"] = panel.groupby("Market_Index")["Index_Change_Percent"].shift(-1)
     panel = panel.dropna(subset=["return_1d"]).reset_index(drop=True)
 
-    # --- Adaptive (volatility-scaled) neutral-drop labeling ---
-    # roll_std_10 zaten add_return_dynamics() içinde shift(1) ile üretildiği için leakage yapmaz.
-    K_VOL = 0.90  # 0.70 / 0.90 / 1.10 gibi değerlerle deneyebilirsin
-    MIN_THR = 0.15  # taban eşik: çok küçük threshold'ları engeller
-
+    # roll_std_10 güvenliği
     if "roll_std_10" not in panel.columns:
-        # Güvenlik: eğer kolon yoksa üret (tamamen geçmişe dayalı)
         panel["roll_std_10"] = panel.groupby("Market_Index")["Index_Change_Percent"].transform(
             lambda s: s.shift(1).rolling(window=10).std()
         ).fillna(0.0)
@@ -287,12 +406,14 @@ def main():
     panel["Target_Direction"] = panel["Target_Direction"].astype(int)
 
     print(f"Adaptive labeling: kept {len(panel)}/{before} rows | K_VOL={K_VOL} MIN_THR={MIN_THR}")
-
     print(f"Eğitime girecek günlük satır sayısı: {len(panel)}")
     print(panel["Target_Direction"].value_counts(normalize=True))
 
-    # embedding matrisi
-    emb_matrix = np.vstack(panel["emb_mean"].to_numpy())
+    if len(panel) < 300:
+        print("[WARN] Çok az satır kaldı; sonuçlar oynak olabilir.")
+
+    # daily embedding matrisi (768)
+    emb_matrix = np.vstack(panel["emb_mean"].to_numpy()).astype(float)
 
     # === FEATURE SET ===
     numeric_cols = [
@@ -355,95 +476,119 @@ def main():
             panel[c] = "UNKNOWN"
     panel[cat_cols] = panel[cat_cols].fillna("UNKNOWN").astype(str)
 
-    X_numeric = panel[numeric_cols].values.astype(float)
-    y = panel["Target_Direction"].values.astype(int)
-
-    # === DATE-BASED SPLIT (OUT-OF-TIME) ===
+    # -----------------------------
+    # Walk-forward CV (optional)
+    # -----------------------------
     unique_dates = np.sort(panel["Date"].unique())
-    cutoff_date = unique_dates[int(len(unique_dates) * 0.8)]
-    train_mask = panel["Date"] <= cutoff_date
-    val_mask = panel["Date"] > cutoff_date
+    if len(unique_dates) < 30:
+        print("[WARN] Unique date sayısı düşük; CV oynak olabilir.")
 
-    X_num_train = X_numeric[train_mask]
-    X_num_val = X_numeric[val_mask]
-    X_cat_train = panel.loc[train_mask, cat_cols].values
-    X_cat_val = panel.loc[val_mask, cat_cols].values
-    X_emb_train = emb_matrix[train_mask.to_numpy()]
-    X_emb_val = emb_matrix[val_mask.to_numpy()]
-    y_train = y[train_mask]
-    y_val = y[val_mask]
+    if CV_MODE:
+        print("\n[CV_MODE=1] Walk-forward evaluation running...")
 
-    # === ADIM 6: Scaling + OHE + SVD ===
-    print("[6/7] Scaling + OHE + SVD(64) + concat...")
-    scaler = StandardScaler()
-    X_num_train_scaled = scaler.fit_transform(X_num_train)
-    X_num_val_scaled = scaler.transform(X_num_val)
+        cut_idx = [max(1, min(len(unique_dates) - 2, int(len(unique_dates) * p))) for p in CV_POINTS]
+        cut_dates = [unique_dates[i] for i in cut_idx]
 
-    try:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
-    except TypeError:
-        ohe = OneHotEncoder(handle_unknown="ignore", sparse=False)
+        folds = []
+        for i, cd in enumerate(cut_dates):
+            if i < len(cut_dates) - 1:
+                vd_end = cut_dates[i + 1]
+                tr_mask = (panel["Date"] <= cd).to_numpy()
+                va_mask = ((panel["Date"] > cd) & (panel["Date"] <= vd_end)).to_numpy()
+            else:
+                tr_mask = (panel["Date"] <= cd).to_numpy()
+                va_mask = (panel["Date"] > cd).to_numpy()
 
-    X_cat_train_ohe = ohe.fit_transform(X_cat_train)
-    X_cat_val_ohe = ohe.transform(X_cat_val)
+            if va_mask.sum() < 50:
+                print(f"[CV] Fold {i+1}: val too small ({int(va_mask.sum())}), skipping.")
+                continue
 
-    SVD_DIM = 64
-    svd = TruncatedSVD(n_components=SVD_DIM, random_state=42)
-    X_emb_train_k = svd.fit_transform(X_emb_train)
-    X_emb_val_k = svd.transform(X_emb_val)
+            m, _, _ = fit_eval_once(
+                panel=panel,
+                emb_matrix=emb_matrix,
+                numeric_cols=numeric_cols,
+                cat_cols=cat_cols,
+                train_mask=tr_mask,
+                val_mask=va_mask,
+                svd_dim=SVD_DIM,
+                seed=42,
+                thr_objective=THR_OBJECTIVE,
+            )
+            folds.append(m)
 
-    X_train_final = np.concatenate([X_num_train_scaled, X_cat_train_ohe, X_emb_train_k], axis=1)
-    X_val_final = np.concatenate([X_num_val_scaled, X_cat_val_ohe, X_emb_val_k], axis=1)
+            print(
+                f"[CV] Fold {i+1} | val_n={m['val_n']} | "
+                f"PR_AUC={m['PR_AUC']:.4f} ROC_AUC={m['ROC_AUC']:.4f} "
+                f"BAcc={m['BalancedAcc']:.4f} MCC={m['MCC']:.4f} thr={m['thr']:.2f}"
+            )
 
-    print(f"Eğitim Matrisi Son Boyutu: {X_train_final.shape}")
-    print(f"Validation Matrisi Son Boyutu: {X_val_final.shape}")
+        if not folds:
+            raise RuntimeError("No valid folds produced. Check CV_POINTS / date distribution.")
 
-    # === ADIM 7: Model Eğitimi ===
-    print("[7/7] Model eğitiliyor...")
-    xgb_model = train_model.train_xgb(
-        X_train=X_train_final,
-        y_train=y_train,
-        X_val=X_val_final,
-        y_val=y_val
+        mean_pr = float(np.mean([f["PR_AUC"] for f in folds]))
+        mean_roc = float(np.mean([f["ROC_AUC"] for f in folds]))
+        mean_ba = float(np.mean([f["BalancedAcc"] for f in folds]))
+        mean_mcc = float(np.mean([f["MCC"] for f in folds]))
+
+        print("\n[CV] MEAN RESULTS")
+        print(f"PR_AUC={mean_pr:.4f} | ROC_AUC={mean_roc:.4f} | BalancedAcc={mean_ba:.4f} | MCC={mean_mcc:.4f}")
+        print("[CV] Done. (CV_MODE=1 -> model kaydı yapılmaz.)")
+        return
+
+    # -----------------------------
+    # Single out-of-time split
+    # -----------------------------
+    cutoff_idx = max(1, min(len(unique_dates) - 2, int(len(unique_dates) * CUTOFF_FRAC)))
+    cutoff_date = unique_dates[cutoff_idx]
+    train_mask = (panel["Date"] <= cutoff_date).to_numpy()
+    val_mask = (panel["Date"] > cutoff_date).to_numpy()
+
+    print(f"\n[Single Split] cutoff_frac={CUTOFF_FRAC:.2f} cutoff_date={cutoff_date}")
+    if val_mask.sum() < 50:
+        print(f"[WARN] Validation set küçük (n={int(val_mask.sum())}).")
+
+    print("[6/7] Scaling + OHE + SVD + concat...")
+    metrics, artifacts, (y_val, y_pred) = fit_eval_once(
+        panel=panel,
+        emb_matrix=emb_matrix,
+        numeric_cols=numeric_cols,
+        cat_cols=cat_cols,
+        train_mask=train_mask,
+        val_mask=val_mask,
+        svd_dim=SVD_DIM,
+        seed=42,
+        thr_objective=THR_OBJECTIVE,
     )
 
-    # === VALIDATION ===
-    val_probs = xgb_model.predict_proba(X_val_final)[:, 1]
+    print(f"[Validation] PR-AUC (Average Precision): {metrics['PR_AUC']:.4f}")
+    print(f"[Validation] ROC-AUC                : {metrics['ROC_AUC']:.4f}")
+    print(
+        f"[Threshold Search:{THR_OBJECTIVE}] Best threshold: {metrics['thr']:.2f} | "
+        f"BalancedAcc={metrics['BalancedAcc']:.4f} | MCC={metrics['MCC']:.4f}"
+    )
 
-    pr_auc = average_precision_score(y_val, val_probs)
-    roc_auc = roc_auc_score(y_val, val_probs)
-    print(f"[Validation] PR-AUC (Average Precision): {pr_auc:.4f}")
-    print(f"[Validation] ROC-AUC                : {roc_auc:.4f}")
-
-    best = None
-    for thr in np.linspace(0.05, 0.95, 91):
-        val_pred = (val_probs >= thr).astype(int)
-        bacc = balanced_accuracy_score(y_val, val_pred)
-        mcc = matthews_corrcoef(y_val, val_pred)
-        score = bacc
-        if best is None or score > best["score"]:
-            best = {"thr": float(thr), "score": float(score), "bacc": float(bacc), "mcc": float(mcc)}
-
-    print(f"[Threshold Search] Best threshold: {best['thr']:.2f} | BalancedAcc={best['bacc']:.4f} | MCC={best['mcc']:.4f}")
-
-    val_pred_best = (val_probs >= best["thr"]).astype(int)
     print("\n[Validation] Confusion Matrix (best thr)")
-    print(confusion_matrix(y_val, val_pred_best))
+    print(metrics["cm"])
     print("\n[Validation] Classification Report (best thr)")
-    print(classification_report(y_val, val_pred_best, target_names=["Down", "Up"]))
+    print(classification_report(y_val, y_pred, target_names=["Down", "Up"]))
 
-    # === SAVE ===
-    os.makedirs("models", exist_ok=True)
-    joblib.dump(best["thr"], "models/threshold.pkl")
-    joblib.dump(xgb_model, "models/xgb_model.pkl")
-    joblib.dump(scaler, "models/scaler.pkl")
-    joblib.dump(numeric_cols, "models/numeric_cols.pkl")
-    joblib.dump(cat_cols, "models/cat_cols.pkl")
-    joblib.dump(ohe, "models/ohe.pkl")
-    joblib.dump(svd, "models/svd.pkl")
+    # -----------------------------
+    # Save artifacts (optional)
+    # -----------------------------
+    if SAVE_MODELS:
+        os.makedirs("models", exist_ok=True)
+        joblib.dump(float(metrics["thr"]), "models/threshold.pkl")
+        joblib.dump(artifacts["model"], "models/xgb_model.pkl")
+        joblib.dump(artifacts["scaler"], "models/scaler.pkl")
+        joblib.dump(numeric_cols, "models/numeric_cols.pkl")
+        joblib.dump(cat_cols, "models/cat_cols.pkl")
+        joblib.dump(artifacts["ohe"], "models/ohe.pkl")
+        joblib.dump(artifacts["svd"], "models/svd.pkl")
 
-    print("\nBAŞARILI! Model kaydedildi.")
-    print("models/xgb_model.pkl, models/scaler.pkl, models/ohe.pkl, models/svd.pkl, models/threshold.pkl")
+        print("\nBAŞARILI! Model kaydedildi.")
+        print("models/xgb_model.pkl, models/scaler.pkl, models/ohe.pkl, models/svd.pkl, models/threshold.pkl")
+    else:
+        print("\n[SAVE_MODELS=0] Model kaydı atlandı.")
 
 
 if __name__ == "__main__":
