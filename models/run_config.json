@@ -1,0 +1,7 @@
+﻿{
+  "K_VOL": 1.1,
+  "MIN_THR": 0.2,
+  "THR_OBJECTIVE": "mcc",
+  "CUTOFF_FRAC_TRAIN": 0.90,
+  "SVD_DIM": 64
+}

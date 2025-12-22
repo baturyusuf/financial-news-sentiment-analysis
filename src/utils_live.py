@@ -116,7 +116,7 @@ def get_news_for_ticker(ticker_obj):
             if response.status_code == 200:
                 root = ET.fromstring(response.content)
                 # İlk 5 haberi al
-                for item in root.findall('./channel/item')[:15]:
+                for item in root.findall('./channel/item')[:500]:
                     title = item.find('title').text if item.find('title') is not None else "No Title"
                     link = item.find('link').text if item.find('link') is not None else "#"
                     source = item.find('source').text if item.find('source') is not None else "Google News"

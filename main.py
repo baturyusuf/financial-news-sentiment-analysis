@@ -593,3 +593,22 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# Powershell'e yapıştır:
+# # config oku
+# $cfg = Get-Content models/run_config.json -Raw | ConvertFrom-Json
+#
+# # JSON -> ENV map
+# $env:K_VOL          = "$($cfg.K_VOL)"
+# $env:MIN_THR        = "$($cfg.MIN_THR)"
+# $env:THR_OBJECTIVE  = "$($cfg.THR_OBJECTIVE)"
+# $env:CUTOFF_FRAC    = "$($cfg.CUTOFF_FRAC_TRAIN)"
+# $env:SVD_DIM        = "$($cfg.SVD_DIM)"
+#
+# # çalışma modu (istersen json’a da koyabilirsin)
+# $env:CV_MODE     = "0"
+# $env:SAVE_MODELS = "1"
+#
+# python main.py
