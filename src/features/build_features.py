@@ -62,8 +62,9 @@ class FinbertFeatureExtractor:
         mean_pool = token_embeddings.mean(dim=0)
         max_pool = token_embeddings.max(dim=0).values
 
-        final_embedding = torch.cat([mean_pool, max_pool], dim=0)
+        final_embedding = mean_pool
         return final_embedding.cpu().numpy()
+
 
 def create_lagged_features(df: pd.DataFrame, col_name: str, lag_days: int = 1) -> pd.DataFrame:
     df[f'Previous_{col_name}_{lag_days}d'] = df[col_name].shift(lag_days)

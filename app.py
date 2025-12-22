@@ -17,15 +17,15 @@ def load_resources():
     try:
         model = joblib.load('models/xgb_model.pkl')
         scaler = joblib.load('models/scaler.pkl')
-        # pca = joblib.load('models/pca.pkl')  # <--- PCA YÜKLENİYOR
+        numeric_cols = joblib.load('models/numeric_cols.pkl')
+        threshold = joblib.load('models/threshold.pkl')
         extractor = build_features.FinbertFeatureExtractor()
-        return model, scaler, extractor
+        return model, scaler, extractor, numeric_cols, threshold
     except Exception as e:
         st.error(f"Model dosyaları eksik! Önce 'python main.py' çalıştırın. Hata: {e}")
-        return None, None, None, None
+        return None, None, None, None, None
 
-
-rf_model, scaler, feature_extractor = load_resources()
+xgb_model, scaler, feature_extractor, numeric_cols, threshold = load_resources()
 
 # === SIDEBAR ===
 st.sidebar.title("FinAI Panel")
@@ -115,30 +115,51 @@ else:
                         latest_data['mentions_stock'] = 1
                         latest_data['Previous_Index_Change_Percent_1d'] = processed_df['Index_Change_Percent'].iloc[-2]
 
-                        latest_data['sent_positive'] = sent_scores['positive']
-                        latest_data['sent_negative'] = sent_scores['negative']
-                        latest_data['sent_neutral'] = sent_scores['neutral']
 
-                        cols = [
-                            'Trading_Volume', 'Previous_Index_Change_Percent_1d', 'Volatility_7d',
-                            'RSI_14', 'Cumulative_Return_3d',
-                            'Gold_close_t1', 'Gold_ret1_t1', 'Oil_close_t1', 'Oil_ret1_t1',
-                            'keyword_bullish', 'keyword_bearish', 'mentions_stock',
-                            'sent_negative', 'sent_neutral', 'sent_positive'
-                        ]
-
-                        for c in cols:
-                            if c not in latest_data.columns: latest_data[c] = 0
-
-                        # 5. Birleştirme
-                        X_numeric = latest_data[cols].values
-                        X_numeric_scaled = scaler.transform(X_numeric)
-
-                        X_final = np.concatenate([X_numeric_scaled, embedding], axis=1)
+                        # for c in cols:
+                        #     if c not in latest_data.columns: latest_data[c] = 0
+                        #
+                        # # 5. Birleştirme
+                        # X_numeric = latest_data[cols].values
+                        # X_numeric_scaled = scaler.transform(X_numeric)
+                        #
+                        # X_final = np.concatenate([X_numeric_scaled, embedding], axis=1)
 
                         # 6. Tahmin
-                        pred = rf_model.predict(X_final)[0]
-                        prob = rf_model.predict_proba(X_final)[0]
+                        st.caption(f"Decision threshold: {float(threshold):.2f}")
+
+                        # --- 0) yfinance Volume -> Trading_Volume hizalama ---
+                        if "Volume" in processed_df.columns and "Trading_Volume" not in processed_df.columns:
+                            processed_df["Trading_Volume"] = processed_df["Volume"]
+
+                        # --- 1) Keyword/mentions feature'larını eğitimdeki mantıkla üret ---
+                        tmp = pd.DataFrame({"Headline": [latest_news["title"]]})
+                        tmp = build_features.add_stock_mention_feature(tmp, headline_col="Headline")
+                        latest_data["keyword_bullish"] = int(tmp.loc[0, "keyword_bullish"])
+                        latest_data["keyword_bearish"] = int(tmp.loc[0, "keyword_bearish"])
+                        latest_data["mentions_stock"] = int(tmp.loc[0, "mentions_stock"])
+
+                        # --- 2) Sentiment feature'larını eğitimdeki gibi üret: sent_score + sent_conf ---
+                        sent_score = sent_scores.get("positive", 0.0) - sent_scores.get("negative", 0.0)
+                        sent_conf = max(sent_scores.values()) if sent_scores else 0.0
+                        latest_data["sent_score"] = float(sent_score)
+                        latest_data["sent_conf"] = float(sent_conf)
+
+                        # --- 3) Eksik kolonları 0 ile tamamla (eğitim feature listesine göre) ---
+                        for c in numeric_cols:
+                            if c not in latest_data.columns:
+                                latest_data[c] = 0
+
+                        # --- 4) Sıralama birebir eğitimle aynı: numeric_cols ---
+                        X_numeric = latest_data[numeric_cols].values
+                        X_numeric_scaled = scaler.transform(X_numeric)
+
+                        # Embedding (1536) + numeric (14) -> 1550
+                        X_final = np.concatenate([X_numeric_scaled, embedding], axis=1)
+
+                        # --- 5) Tahmin: threshold ile karar ver ---
+                        p_up = float(xgb_model.predict_proba(X_final)[0, 1])
+                        pred = 1 if p_up >= float(threshold) else 0
 
                         col_res1, col_res2 = st.columns(2)
 
@@ -156,6 +177,6 @@ else:
 
                         with col_res2:
                             if pred == 1:
-                                st.success(f"Yön Tahmini: YÜKSELİŞ (%{prob[1] * 100:.1f})")
+                                st.success(f"Yön Tahmini: YÜKSELİŞ (P(Up)=%{p_up * 100:.1f})")
                             else:
-                                st.error(f"Yön Tahmini: DÜŞÜŞ (%{prob[0] * 100:.1f})")
+                                st.error(f"Yön Tahmini: DÜŞÜŞ (P(Up)=%{p_up * 100:.1f})")
