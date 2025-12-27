@@ -1,7 +1,32 @@
 ﻿{
-  "K_VOL": 1.1,
-  "MIN_THR": 0.2,
-  "THR_OBJECTIVE": "mcc",
-  "CUTOFF_FRAC_TRAIN": 0.90,
-  "SVD_DIM": 64
+  "LABEL": {
+    "K_VOL": 1.1,
+    "MIN_THR": 0.2
+  },
+  "THRESHOLD": {
+    "THR_OBJECTIVE": "mcc"
+  },
+  "XGB": {
+    "XGB_MAX_DEPTH": 4,
+    "XGB_MIN_CHILD_WEIGHT": 5,
+    "XGB_SUBSAMPLE": 0.6,
+    "XGB_COLSAMPLE_BYTREE": 0.7,
+    "XGB_REG_LAMBDA": 3.0,
+    "XGB_LEARNING_RATE": 0.02,
+    "XGB_GAMMA": 0.5,
+    "XGB_N_ESTIMATORS": 6000,
+    "XGB_EARLY_STOPPING": 150,
+    "XGB_TREE_METHOD": "hist",
+    "XGB_RANDOM_STATE": 123
+  },
+  "CV_RUN": {
+    "CV_MODE": 1,
+    "CV_POINTS": "0.60,0.70,0.80,0.90",
+    "SAVE_MODELS": 0
+  },
+  "TRAIN_RUN": {
+    "CV_MODE": 0,
+    "SAVE_MODELS": 1,
+    "CUTOFF_FRAC": 0.90
+  }
 }

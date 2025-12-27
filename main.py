@@ -596,19 +596,34 @@ if __name__ == "__main__":
 
 
 
-# Powershell'e yapıştır:
-# # config oku
+# JSON oku
 # $cfg = Get-Content models/run_config.json -Raw | ConvertFrom-Json
 #
-# # JSON -> ENV map
-# $env:K_VOL          = "$($cfg.K_VOL)"
-# $env:MIN_THR        = "$($cfg.MIN_THR)"
-# $env:THR_OBJECTIVE  = "$($cfg.THR_OBJECTIVE)"
-# $env:CUTOFF_FRAC    = "$($cfg.CUTOFF_FRAC_TRAIN)"
-# $env:SVD_DIM        = "$($cfg.SVD_DIM)"
+# # Ortak ENV'ler: LABEL + THRESHOLD + XGB
+# $env:K_VOL          = "$($cfg.LABEL.K_VOL)"
+# $env:MIN_THR        = "$($cfg.LABEL.MIN_THR)"
+# $env:THR_OBJECTIVE  = "$($cfg.THRESHOLD.THR_OBJECTIVE)"
 #
-# # çalışma modu (istersen json’a da koyabilirsin)
-# $env:CV_MODE     = "0"
-# $env:SAVE_MODELS = "1"
+# $env:XGB_MAX_DEPTH         = "$($cfg.XGB.XGB_MAX_DEPTH)"
+# $env:XGB_MIN_CHILD_WEIGHT  = "$($cfg.XGB.XGB_MIN_CHILD_WEIGHT)"
+# $env:XGB_SUBSAMPLE         = "$($cfg.XGB.XGB_SUBSAMPLE)"
+# $env:XGB_COLSAMPLE_BYTREE  = "$($cfg.XGB.XGB_COLSAMPLE_BYTREE)"
+# $env:XGB_REG_LAMBDA        = "$($cfg.XGB.XGB_REG_LAMBDA)"
+# $env:XGB_LEARNING_RATE     = "$($cfg.XGB.XGB_LEARNING_RATE)"
+# $env:XGB_GAMMA             = "$($cfg.XGB.XGB_GAMMA)"
+# $env:XGB_N_ESTIMATORS      = "$($cfg.XGB.XGB_N_ESTIMATORS)"
+# $env:XGB_EARLY_STOPPING    = "$($cfg.XGB.XGB_EARLY_STOPPING)"
+# $env:XGB_TREE_METHOD       = "$($cfg.XGB.XGB_TREE_METHOD)"
+# $env:XGB_RANDOM_STATE      = "$($cfg.XGB.XGB_RANDOM_STATE)"
 #
+# # --- 1) CV koşusu (save yok) ---
+# $env:CV_MODE     = "$($cfg.CV_RUN.CV_MODE)"
+# $env:CV_POINTS   = "$($cfg.CV_RUN.CV_POINTS)"
+# $env:SAVE_MODELS = "$($cfg.CV_RUN.SAVE_MODELS)"
+# python main.py
+#
+# # --- 2) Train koşusu (save var) ---
+# $env:CV_MODE     = "$($cfg.TRAIN_RUN.CV_MODE)"
+# $env:SAVE_MODELS = "$($cfg.TRAIN_RUN.SAVE_MODELS)"
+# $env:CUTOFF_FRAC = "$($cfg.TRAIN_RUN.CUTOFF_FRAC)"
 # python main.py
